@@ -903,11 +903,15 @@ async def _execute_research(target: str, ws=None):
             try:
                 notify_text = f"Research is complete, sir. Report is open in your browser."
                 audio = await synthesize_speech(notify_text)
+                await ws.send_json({"type": "status", "state": "speaking"})
                 if audio:
-                    await ws.send_json({"type": "status", "state": "speaking"})
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": notify_text})
-                    await ws.send_json({"type": "status", "state": "idle"})
-                    log.info(f"JARVIS: {notify_text}")
+                else:
+                    # No voice available — the reply still has to reach the client,
+                    # which shows it on screen.
+                    await ws.send_json({"type": "text", "text": notify_text})
+                await ws.send_json({"type": "status", "state": "idle"})
+                log.info(f"JARVIS: {notify_text}")
             except Exception:
                 pass  # WebSocket might be gone
 
@@ -918,6 +922,8 @@ async def _execute_research(target: str, ws=None):
                 audio = await synthesize_speech("Research timed out, sir. It was taking too long.")
                 if audio:
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": "Research timed out, sir."})
+                else:
+                    await ws.send_json({"type": "text", "text": "Research timed out, sir."})
             except Exception:
                 pass
     except Exception as e:
@@ -985,10 +991,13 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
         if not project_dir:
             msg = f"Couldn't find the {project_name} project directory, sir."
             audio = await synthesize_speech(msg)
-            if audio and ws:
+            if ws:
                 try:
                     await ws.send_json({"type": "status", "state": "speaking"})
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                    if audio:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                    else:
+                        await ws.send_json({"type": "text", "text": msg})
                 except Exception:
                     pass
             return
@@ -1081,9 +1090,12 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
         try:
             msg = f"Had trouble connecting to {project_name}, sir."
             audio = await synthesize_speech(msg)
-            if audio and ws:
+            if ws:
                 await ws.send_json({"type": "status", "state": "speaking"})
-                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                if audio:
+                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                else:
+                    await ws.send_json({"type": "text", "text": msg})
         except Exception:
             pass
 
@@ -1109,11 +1121,13 @@ async def self_work_and_notify(session: WorkSession, prompt: str, ws):
 
             try:
                 audio = await synthesize_speech(msg)
+                await ws.send_json({"type": "status", "state": "speaking"})
                 if audio:
-                    await ws.send_json({"type": "status", "state": "speaking"})
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-                    await ws.send_json({"type": "status", "state": "idle"})
-                    log.info(f"JARVIS: {msg}")
+                else:
+                    await ws.send_json({"type": "text", "text": msg})
+                await ws.send_json({"type": "status", "state": "idle"})
+                log.info(f"JARVIS: {msg}")
             except Exception:
                 pass
     except Exception as e:
@@ -1701,7 +1715,7 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
             try:
                 await ws.send_json({"type": "status", "state": "speaking"})
                 if audio:
-                    await ws.send_json({"type": "audio", "data": audio, "text": result_text})
+                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": result_text})
                 else:
                     await ws.send_json({"type": "text", "text": result_text})
                 await ws.send_json({"type": "status", "state": "idle"})
@@ -1721,7 +1735,9 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
             audio = await synthesize_speech(fallback)
             await ws.send_json({"type": "status", "state": "speaking"})
             if audio:
-                await ws.send_json({"type": "audio", "data": audio, "text": fallback})
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": fallback})
+            else:
+                await ws.send_json({"type": "text", "text": fallback})
             await ws.send_json({"type": "status", "state": "idle"})
         except Exception:
             pass
@@ -1997,13 +2013,15 @@ async def voice_handler(ws: WebSocket):
             async def _send_greeting():
                 try:
                     audio_bytes = await synthesize_speech(greeting)
+                    await ws.send_json({"type": "status", "state": "speaking"})
                     if audio_bytes:
                         encoded = base64.b64encode(audio_bytes).decode()
-                        await ws.send_json({"type": "status", "state": "speaking"})
                         await ws.send_json({"type": "audio", "data": encoded, "text": greeting})
-                        history.append({"role": "assistant", "content": greeting})
-                        log.info(f"JARVIS: {greeting}")
-                        await ws.send_json({"type": "status", "state": "idle"})
+                    else:
+                        await ws.send_json({"type": "text", "text": greeting})
+                    history.append({"role": "assistant", "content": greeting})
+                    log.info(f"JARVIS: {greeting}")
+                    await ws.send_json({"type": "status", "state": "idle"})
                 except Exception as e:
                     log.warning(f"Greeting failed: {e}")
 
@@ -2030,7 +2048,7 @@ async def voice_handler(ws: WebSocket):
                 await ws.send_json({"type": "status", "state": "speaking"})
                 audio = await synthesize_speech(tts)
                 if audio:
-                    await ws.send_json({"type": "audio", "data": audio, "text": response_text})
+                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
                 else:
                     await ws.send_json({"type": "text", "text": response_text})
                 continue
@@ -2361,10 +2379,13 @@ async def voice_handler(ws: WebSocket):
                                         else:
                                             msg = f"Couldn't find a note matching '{search_term}', sir."
                                         audio = await synthesize_speech(strip_markdown_for_tts(msg))
-                                        if audio and _ws:
+                                        if _ws:
                                             try:
                                                 await _ws.send_json({"type": "status", "state": "speaking"})
-                                                await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                                                if audio:
+                                                    await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                                                else:
+                                                    await _ws.send_json({"type": "text", "text": msg})
                                             except Exception:
                                                 pass
                                     asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
