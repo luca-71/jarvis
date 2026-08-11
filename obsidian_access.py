@@ -19,6 +19,8 @@ import os
 import re
 from pathlib import Path
 
+from phrases import phrase
+
 log = logging.getLogger("jarvis.obsidian")
 
 # Folders that hold no prose worth searching: Obsidian's own config, plus the
@@ -198,10 +200,10 @@ async def vault_stats() -> dict:
 def format_search_for_voice(hits: list[dict], query: str) -> str:
     """Phrase search results as JARVIS would say them."""
     if not hits:
-        return f"Nothing in your vault about {query}, sir."
+        return phrase("vault.nothing", query=query)
     top = hits[0]
-    line = f"Your note '{top['title']}' says: {top['snippet']}"
+    line = phrase("vault.says", title=top["title"], snippet=top["snippet"])
     if len(hits) > 1:
         others = ", ".join(h["title"] for h in hits[1:3])
-        line += f" There's also {others}."
+        line += " " + phrase("vault.also", titles=others)
     return line
