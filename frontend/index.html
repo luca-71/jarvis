@@ -34,6 +34,20 @@
 
     <div id="jarvis-caption"></div>
     <div id="status-text"></div>
+
+    <!-- Type instead of speaking. Hidden until summoned with ⌘K or by typing. -->
+    <div id="text-bar">
+      <input
+        id="text-input"
+        type="text"
+        autocomplete="off"
+        autocorrect="off"
+        spellcheck="false"
+        placeholder="scrivi a JARVIS…"
+      />
+      <span id="text-hint">⏎</span>
+    </div>
+
     <div id="jarvis-label">JARVIS</div>
     <div id="error-text"></div>
     <script type="module" src="/src/main.ts"></script>

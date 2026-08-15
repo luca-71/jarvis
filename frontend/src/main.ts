@@ -163,6 +163,139 @@ const voiceInput = createVoiceInput(
 );
 
 // ---------------------------------------------------------------------------
+// Text input — for when speaking is not an option
+// ---------------------------------------------------------------------------
+
+/**
+ * A typed message travels the same path a spoken one does; the only addition
+ * is `silent`, which tells the server to answer in text rather than out loud.
+ * Typing usually means someone nearby should not have to hear this.
+ *
+ * The bar stays hidden until summoned, so the orb keeps the screen to itself.
+ */
+const textBar = document.getElementById("text-bar")!;
+const textInput = document.getElementById("text-input") as HTMLInputElement;
+
+let textBarOpen = false;
+
+function openTextBar(seed = "") {
+  if (textBarOpen) return;
+  textBarOpen = true;
+  textBar.classList.add("visible");
+  document.body.classList.add("text-open");
+
+  // The microphone would otherwise keep listening and send whatever it hears
+  // while the user is mid-sentence at the keyboard — two inputs racing to
+  // answer the same moment.
+  discardUtterance();
+  voiceInput.pause();
+
+  if (seed) textInput.value = seed;
+  textInput.focus();
+  updateHint();
+}
+
+function closeTextBar() {
+  if (!textBarOpen) return;
+  textBarOpen = false;
+  textBar.classList.remove("visible");
+  document.body.classList.remove("text-open");
+  textInput.value = "";
+  textInput.blur();
+  updateHint();
+
+  // Muted means the user switched the microphone off deliberately; closing the
+  // bar must not quietly switch it back on.
+  if (!isMuted && currentState !== "thinking" && currentState !== "speaking") {
+    voiceInput.resume();
+  }
+}
+
+function updateHint() {
+  textBar.classList.toggle("has-text", textInput.value.trim().length > 0);
+}
+
+function sendTypedMessage() {
+  const text = textInput.value.trim();
+  if (!text) return;
+
+  audioPlayer.stop(); // Cut off any reply still playing, as speaking does.
+  socket.send({ type: "transcript", text, isFinal: true, silent: true });
+  transition("thinking");
+
+  // The bar stays open: someone who typed once is usually still unable to
+  // speak, and reopening it for every message would be its own annoyance.
+  textInput.value = "";
+  updateHint();
+}
+
+textInput.addEventListener("input", updateHint);
+
+textInput.addEventListener("keydown", (e) => {
+  // Keystrokes inside the bar are the bar's own business — without this they
+  // would also reach the global handler below and re-trigger it.
+  e.stopPropagation();
+  if (e.key === "Enter") {
+    e.preventDefault();
+    sendTypedMessage();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    closeTextBar();
+  }
+});
+
+/** True when the keystroke belongs to some other field — settings, mainly. */
+function isTypingElsewhere(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || !el.tagName) return false;
+  const tag = el.tagName.toLowerCase();
+  return (
+    tag === "input" ||
+    tag === "textarea" ||
+    tag === "select" ||
+    el.isContentEditable
+  );
+}
+
+/**
+ * The settings panel is a modal, so keystrokes over it are meant for it — even
+ * the ones that land on the backdrop rather than on a field.
+ */
+function settingsOpen(): boolean {
+  return !!document.getElementById("settings-container")?.classList.contains("open");
+}
+
+document.addEventListener("keydown", (e) => {
+  // Escape is handled here as well as on the input itself, so the bar can
+  // always be dismissed even if focus has drifted somewhere else — otherwise a
+  // bar that lost focus would be stuck open with no way back to the orb.
+  if (textBarOpen && e.key === "Escape") {
+    e.preventDefault();
+    closeTextBar();
+    return;
+  }
+
+  if (textBarOpen || settingsOpen() || isTypingElsewhere(e.target)) return;
+
+  // ⌘K / Ctrl-K summons it deliberately.
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    openTextBar();
+    return;
+  }
+
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+  // Otherwise just start typing. A single printable character opens the bar
+  // and becomes its first character, so the thought is never interrupted by
+  // having to find a button first.
+  if (e.key.length === 1 && e.key !== " ") {
+    e.preventDefault();
+    openTextBar(e.key);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Audio playback finished
 // ---------------------------------------------------------------------------
 

@@ -86,6 +86,20 @@ CATALOGUE: dict[str, str] = {
     "vault.says": "Your note '{title}' says: {snippet}",
     "vault.also": "There's also {titles}.",
 
+    # Timers — spoken when one comes due, with no LLM in the loop to phrase it.
+    # Deliberately free of durations and counts: rendering "10 minutes" needs
+    # per-language plural rules the translator cannot express in a template.
+    # Anything numeric is left to the model, which sees timers in its context.
+    "timer.done": "{honorific}, your {label} timer is up.",
+    "timer.done_plain": "{honorific}, that's time.",
+    "timer.done_late": "{honorific}, your {label} timer came due while I was away.",
+    "timer.done_late_plain": "{honorific}, a timer came due while I was away.",
+
+    # Power
+    "battery.low": "{honorific}, the battery is getting low.",
+    "battery.very_low": "{honorific}, the battery is very low. Worth finding a charger.",
+    "battery.critical": "{honorific}, the battery is critical. Plug in now.",
+
     # Failures
     "error.generic": "Something went wrong, {honorific}.",
 }

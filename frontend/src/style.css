@@ -438,3 +438,97 @@ html, body {
   display: flex;
   justify-content: flex-end;
 }
+
+/* ---------------------------------------------------------------------------
+   Text bar — for when speaking is not an option.
+
+   Hidden until summoned (⌘K, or simply starting to type), because the empty
+   orb is the whole visual idea and a permanent input box would sit on top of
+   it all day. Sound is off while it is open, so the reply arrives as a caption
+   rather than a voice.
+   --------------------------------------------------------------------------- */
+
+#text-bar {
+  position: fixed;
+  bottom: 38px;
+  left: 50%;
+  width: min(640px, calc(100% - 48px));
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 18px;
+  background: rgba(8, 12, 20, 0.82);
+  border: 1px solid rgba(14, 165, 233, 0.22);
+  border-radius: 12px;
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+  z-index: 20;
+
+  /* Closed state. Kept out of the tab order and out of the way of clicks so
+     the bar cannot be reached while invisible. */
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateX(-50%) translateY(10px);
+  /* visibility flips instantly on the way in, and only after the fade on the
+     way out. Transitioning it symmetrically leaves the bar `hidden` for the
+     length of the animation — and a hidden element cannot take focus, so the
+     first keystroke would open the bar and every keystroke after it would
+     fall through to the document and be swallowed. */
+  transition: opacity 0.22s ease, transform 0.22s ease, visibility 0s linear 0.22s;
+}
+
+#text-bar.visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+  transition: opacity 0.22s ease, transform 0.22s ease, visibility 0s;
+}
+
+#text-bar:focus-within {
+  border-color: rgba(14, 165, 233, 0.5);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55), 0 0 0 3px rgba(14, 165, 233, 0.1);
+}
+
+#text-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: rgba(219, 238, 252, 0.95);
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 300;
+  letter-spacing: 0.3px;
+  caret-color: rgba(14, 165, 233, 0.9);
+}
+
+#text-input::placeholder {
+  color: rgba(219, 238, 252, 0.32);
+  font-weight: 300;
+}
+
+#text-hint {
+  color: rgba(14, 165, 233, 0.45);
+  font-size: 13px;
+  line-height: 1;
+  user-select: none;
+  transition: color 0.2s ease;
+}
+
+/* Only suggest Enter once there is something to send. */
+#text-bar.has-text #text-hint {
+  color: rgba(14, 165, 233, 0.85);
+}
+
+/* The caption normally sits just above the status line; with the bar open it
+   would land behind it, so it steps up to make room. */
+body.text-open #jarvis-caption {
+  bottom: 108px;
+}
+
+body.text-open #status-text {
+  opacity: 0;
+}

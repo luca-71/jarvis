@@ -55,6 +55,8 @@ from phrases import phrase, ensure_language
 from tts import list_voices, resolve_voice, speak as macos_speak
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
+import battery
+import timers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
@@ -158,7 +160,15 @@ _SETTINGS_PROBE_TIMEOUT = 8.0
 
 DESKTOP_PATH = Path.home() / "Desktop"
 
-JARVIS_SYSTEM_PROMPT = """\
+# The prompt used to be one template, formatted fresh on every turn with
+# {current_time} sitting near the top. Prompt caching is a byte-exact prefix
+# match, so a value that changes every minute — positioned before ~13K
+# characters of otherwise-static instructions — meant nothing after it could
+# ever be served from cache, on any turn, ever. Splitting the instructions
+# (STATIC, cached) from the per-turn context (DYNAMIC, never cached) is what
+# makes the split actually pay off; see generate_response() for the request
+# shape and cache_control placement.
+JARVIS_SYSTEM_STATIC = """\
 You are JARVIS — Just A Rather Very Intelligent System. You serve as {user_name}'s AI assistant, modeled precisely after Tony Stark's AI from the MCU films.
 
 VOICE & PERSONALITY:
@@ -171,9 +181,8 @@ VOICE & PERSONALITY:
 - When things go wrong, get CALMER, not more alarmed
 
 TIME & WEATHER AWARENESS:
-- Current time: {current_time}
-- Greet accordingly: "Good morning, sir" / "Good evening, sir"
-- {weather_info}
+- Greet according to the time of day: "Good morning, sir" / "Good evening, sir"
+- The current time and today's weather are given below, under CURRENT CONTEXT.
 
 CONVERSATION STYLE:
 - "Will do, sir." — acknowledging tasks
@@ -295,6 +304,14 @@ CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're
 - [ACTION:CREATE_NOTE] title ||| body — create a new Apple Note. For saving plans, ideas, lists.
   "save that as a note" → [ACTION:CREATE_NOTE] Day Plan March 19 ||| Morning: client calls. Afternoon: TikTok dashboard. Evening: JARVIS improvements.
 - [ACTION:READ_NOTE] title search — read an existing Apple Note by title keyword.
+- [ACTION:TIMER] seconds ||| label — set a countdown. ALWAYS convert the spoken duration to a whole number of SECONDS yourself: "ten minutes" → 600, "an hour and a half" → 5400. The label is 1-3 words naming what it is for ("pasta", "laundry"), empty if the user gave none. Say the confirmation in your own words BEFORE the tag — that sentence is what gets spoken, so it must read naturally in the user's language.
+  "set a timer for 10 minutes" → "Ten minutes, sir. [ACTION:TIMER] 600 ||| "
+  "timer for the pasta, 8 minutes" → "Eight minutes for the pasta, sir. [ACTION:TIMER] 480 ||| pasta"
+  This is for COUNTDOWNS only. A specific time of day, or anything further off than today, is a task or a calendar event — use ADD_TASK.
+- [ACTION:CANCEL_TIMER] label — cancel a running timer. Pass the label to cancel one, or leave it empty to cancel all of them.
+CRITICAL: [ACTION:TIMER] STARTS a new countdown. Use it ONLY when the user asks for one to be set. When they ask ABOUT a timer that is already running — "how long left?", "is it still going?", "quanto manca?" — ANSWER from the TIMERS section below and emit NO tag whatsoever. Tagging that question starts a second timer, and the user gets told twice when it comes due.
+  "how long left on the pasta?" → "Just under four minutes, sir." — no tag.
+  Phrase the remaining time naturally. Never read out raw seconds like "247 seconds".
 
 You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
 
@@ -308,6 +325,15 @@ IMPORTANT:
 - Do NOT use action tags if the user is still explaining (ask questions first)
 - Do NOT use [ACTION:BROWSE] just because someone mentions a URL in conversation
 - When in doubt, just TALK — you can always act later
+"""
+
+
+# Everything that changes turn to turn. Rendered as a separate, uncached
+# content block placed after JARVIS_SYSTEM_STATIC — see generate_response().
+JARVIS_SYSTEM_DYNAMIC = """\
+CURRENT CONTEXT:
+Time: {current_time}
+Weather: {weather_info}
 
 SCREEN AWARENESS:
 {screen_context}
@@ -320,6 +346,9 @@ EMAIL:
 
 ACTIVE TASKS:
 {active_tasks}
+
+{timer_context}
+{battery_context}
 
 DISPATCHES:
 If the DISPATCHES section shows a recent completed result for a project, DO NOT dispatch again. Use the existing result. Only re-dispatch if the user explicitly asks for a FRESH review or NEW information.
@@ -917,7 +946,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CALENDAR|MAIL|VAULT)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CALENDAR|MAIL|VAULT|TIMER|CANCEL_TIMER)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -1343,19 +1372,47 @@ async def generate_response(
     # Check if any lookups are in progress
     lookup_status = get_lookup_status()
 
-    system = JARVIS_SYSTEM_PROMPT.format(
+    static_block = JARVIS_SYSTEM_STATIC.format(
+        user_name=USER_NAME,
+        honorific=_current_honorific(),
+        project_dir=PROJECT_DIR,
+    )
+    dynamic_block = JARVIS_SYSTEM_DYNAMIC.format(
         current_time=current_time,
         weather_info=weather_info,
         screen_context=screen_ctx or "Not checked yet.",
         calendar_context=calendar_ctx,
         mail_context=mail_ctx,
         active_tasks=task_mgr.get_active_tasks_summary(),
+        timer_context=timers.format_for_prompt(),
+        battery_context=battery.format_for_prompt(),
         dispatch_context=dispatch_registry.format_for_prompt(),
         known_projects=format_projects_for_prompt(projects),
-        user_name=USER_NAME,
-        honorific=_current_honorific(),
-        project_dir=PROJECT_DIR,
     )
+    # Two blocks, one breakpoint. static_block is the ~3600-token instruction
+    # set — personality, capabilities, the whole [ACTION:X] catalogue — and is
+    # identical on every turn except when the user's name, honorific or
+    # project directory changes, which happens through settings, not
+    # conversation. dynamic_block carries everything that actually moves
+    # (the clock alone guarantees a miss every single turn) and is deliberately
+    # left uncached: caching a block only to have it invalidated on the next
+    # request wastes the ~1.25x write premium for zero reads.
+    system = [
+        {
+            "type": "text",
+            "text": static_block,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": dynamic_block,
+        },
+    ]
+
+    # Appended as further blocks rather than string concatenation — each is
+    # its own uncached tail, and content blocks after the cache breakpoint
+    # read as continuous text to the model regardless of block boundaries.
+    #
     # The prompt above is written in English and would answer an Italian
     # question in English, which makes the speech-language setting only half
     # work. Kept to a bare language directive on purpose: wording that also
@@ -1366,29 +1423,35 @@ async def generate_response(
     if not speech_lang.startswith("en"):
         language = SPEECH_LANGUAGES.get(speech_lang, speech_lang)
         honorific = _current_honorific()
-        system += (
+        system.append({"type": "text", "text": (
             f"\n\nLANGUAGE: The user speaks {language}. Write every spoken reply in {language}, "
             f"keeping the same dry, economical butler voice. One exception: address him as "
             f'"{honorific}" — that exact word, letter for letter. It is his chosen form of '
             f"address, not vocabulary to translate into {language} or to inflect for gender. "
             f'Writing anything other than "{honorific}" is an error.'
-        )
+        )})
 
     if lookup_status:
-        system += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
+        system.append({"type": "text", "text":
+            f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
+        })
 
     # Inject relevant memories and tasks
     memory_ctx = build_memory_context(text)
     if memory_ctx:
-        system += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
+        system.append({"type": "text", "text": f"\n\nJARVIS MEMORY:\n{memory_ctx}"})
 
     # Three-tier memory — inject rolling summary of earlier conversation
     if session_summary:
-        system += f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
+        system.append({"type": "text", "text":
+            f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
+        })
 
     # Self-awareness — remind JARVIS of last response to avoid repetition
     if last_response:
-        system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
+        system.append({"type": "text", "text":
+            f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
+        })
 
     # Use conversation history — keep the last 20 messages for context
     # (older conversation is captured in session_summary)
@@ -1399,7 +1462,11 @@ async def generate_response(
 
     try:
         response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            # Sonnet 5's cache minimum is 1024 tokens; Haiku 4.5's is 4096,
+            # which the static block (~3600 tokens) falls short of — caching
+            # would write every turn and never once read. Sonnet is the
+            # cheapest current model where the cache actually activates.
+            model="claude-sonnet-5",
             max_tokens=250,  # Extra room for [ACTION:X] tags
             system=system,
             messages=messages,
@@ -1475,12 +1542,26 @@ def _cost_from_tokens(input_t: int, output_t: int) -> float:
 
 def track_usage(response):
     """Track token usage from an Anthropic API response."""
-    inp = getattr(response.usage, "input_tokens", 0) if hasattr(response, "usage") else 0
-    out = getattr(response.usage, "output_tokens", 0) if hasattr(response, "usage") else 0
+    usage = getattr(response, "usage", None)
+    inp = getattr(usage, "input_tokens", 0) or 0
+    out = getattr(usage, "output_tokens", 0) or 0
     _session_tokens["input"] += inp
     _session_tokens["output"] += out
     _session_tokens["api_calls"] += 1
     _append_usage_entry(inp, out, "api")
+
+    # A silent cache invalidator (a byte changed somewhere in the prefix) is
+    # otherwise invisible — the request just succeeds at full price. Logging
+    # every read is noisy; logging a miss on a call that expects to cache is
+    # the useful signal, since it should be rare after the first request.
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    log.info(f"Usage: input={inp} output={out} cache_read={cache_read} cache_write={cache_write}")
+    if cache_write and not cache_read:
+        log.warning(
+            f"Prompt cache write with no read ({cache_write} tokens) — "
+            "the cached prefix changed since the last call, or this is the first request"
+        )
 
 
 def get_usage_summary() -> str:
@@ -1585,6 +1666,92 @@ return windowList
     log.info("Context refresh thread started")
 
 
+# ---------------------------------------------------------------------------
+# Quiet mode
+# ---------------------------------------------------------------------------
+# Typing rather than speaking is a statement about the room, not about the
+# microphone: the reason to type is usually that talking would disturb someone.
+# So a typed message turns the voice off until the user speaks again, and that
+# covers everything JARVIS might say meanwhile — a timer coming due in the
+# middle of a meeting is precisely the noise this is meant to prevent.
+#
+# One flag for the process rather than one per socket, because there is one
+# user, and the orb and the browser tab are two windows onto the same room.
+
+_quiet_mode = False
+
+
+def set_quiet_mode(quiet: bool):
+    global _quiet_mode
+    if quiet != _quiet_mode:
+        log.info(f"Quiet mode {'on' if quiet else 'off'}")
+    _quiet_mode = quiet
+
+
+# ---------------------------------------------------------------------------
+# Unprompted speech — timers coming due, power running out
+# ---------------------------------------------------------------------------
+# Every other thing JARVIS says is a reply, so it has a WebSocket in hand and a
+# `history` to append to. These two start from a clock instead, and go to
+# whoever happens to be listening.
+
+
+async def _announce(text: str):
+    """Speak `text` to every connected client, unprompted.
+
+    Silently does nothing when nobody is connected — a timer firing against no
+    listener is not an error worth logging every minute.
+    """
+    if not text or not task_manager._websockets:
+        return
+
+    if _quiet_mode:
+        # Still delivered — the caption is the whole point of quiet mode, not a
+        # degraded fallback.
+        await task_manager._notify({"type": "text", "text": text})
+        await task_manager._notify({"type": "status", "state": "idle"})
+        log.info(f"JARVIS (quiet): {text}")
+        return
+
+    audio = await synthesize_speech(strip_markdown_for_tts(text))
+    await task_manager._notify({"type": "status", "state": "speaking"})
+    if audio:
+        await task_manager._notify({
+            "type": "audio",
+            "data": base64.b64encode(audio).decode(),
+            "text": text,
+        })
+    else:
+        await task_manager._notify({"type": "text", "text": text})
+    await task_manager._notify({"type": "status", "state": "idle"})
+    log.info(f"JARVIS: {text}")
+
+
+async def _on_timer_fired(timer: "timers.Timer", late: bool):
+    if late:
+        key = "timer.done_late" if timer.label else "timer.done_late_plain"
+    else:
+        key = "timer.done" if timer.label else "timer.done_plain"
+    await _announce(phrase(key, label=timer.label))
+
+
+async def _on_battery_low(state: "battery.BatteryState", level: int):
+    key = {20: "battery.low", 10: "battery.very_low", 5: "battery.critical"}.get(
+        level, "battery.low"
+    )
+    await _announce(phrase(key))
+
+
+timer_service = timers.TimerService(
+    _on_timer_fired,
+    has_listener=lambda: bool(task_manager._websockets),
+)
+battery_monitor = battery.BatteryMonitor(
+    _on_battery_low,
+    has_listener=lambda: bool(task_manager._websockets),
+)
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global anthropic_client, cached_projects
@@ -1602,9 +1769,19 @@ async def lifespan(application: FastAPI):
 
     # Start context refresh in a separate thread (never touches event loop)
     _refresh_context_sync()
+
+    # Timers outlive the process they were set in, so the scheduler picks up
+    # whatever the table already holds — including anything that came due while
+    # the server was down.
+    timer_service.start()
+    battery_monitor.start()
+
     log.info("JARVIS server starting")
 
     yield
+
+    timer_service.stop()
+    battery_monitor.stop()
 
 
 app = FastAPI(title="JARVIS Server", version="0.1.0", lifespan=lifespan)
@@ -2261,9 +2438,18 @@ async def voice_handler(ws: WebSocket):
             if msg.get("type") != "transcript" or not msg.get("isFinal"):
                 continue
 
-            user_text = apply_speech_corrections(msg.get("text", "").strip())
+            # Typed input arrives already spelled correctly; the speech
+            # corrections exist to repair what the recogniser mishears, and
+            # running them over a keyboard would only introduce errors.
+            typed = bool(msg.get("silent"))
+            raw_text = msg.get("text", "").strip()
+            user_text = raw_text if typed else apply_speech_corrections(raw_text)
             if not user_text:
                 continue
+
+            # Speaking again lifts quiet mode: the user has just demonstrated
+            # that talking out loud is fine after all.
+            set_quiet_mode(typed)
 
             # Cancel any in-flight response
             _current_response_id += 1
@@ -2572,6 +2758,23 @@ async def voice_handler(ws: WebSocket):
                                 elif embedded_action["action"] == "remember":
                                     remember(embedded_action["target"].strip(), mem_type="fact", importance=7)
                                     log.info(f"Memory stored: {embedded_action['target'][:60]}")
+                                elif embedded_action["action"] == "timer":
+                                    target = embedded_action["target"]
+                                    raw_seconds, _, label = target.partition("|||")
+                                    seconds = timers.parse_seconds(raw_seconds)
+                                    if seconds is None:
+                                        # JARVIS has already said "ten minutes,
+                                        # sir" by this point, so a bad duration
+                                        # would leave it confidently lying. Log
+                                        # loudly; there is nothing to undo.
+                                        log.warning(f"TIMER tag had no usable duration: {target!r}")
+                                    else:
+                                        timers.create_timer(seconds, label.strip())
+                                        timer_service.notify()
+                                elif embedded_action["action"] == "cancel_timer":
+                                    cancelled = timers.cancel_matching(embedded_action["target"])
+                                    timer_service.notify()
+                                    log.info(f"Cancelled {len(cancelled)} timer(s)")
                                 elif embedded_action["action"] == "create_note":
                                     target = embedded_action["target"]
                                     if "|||" in target:
@@ -2642,15 +2845,20 @@ async def voice_handler(ws: WebSocket):
                 if anthropic_client and len(user_text) > 15:
                     asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
 
-                # TTS
-                tts = strip_markdown_for_tts(response_text)
-                await ws.send_json({"type": "status", "state": "speaking"})
-                audio = await synthesize_speech(tts)
-                if audio:
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
-                else:
+                # TTS — skipped entirely when the question was typed, since the
+                # caption already carries the answer and the point was silence.
+                if _quiet_mode:
                     await ws.send_json({"type": "text", "text": response_text})
                     await ws.send_json({"type": "status", "state": "idle"})
+                else:
+                    tts = strip_markdown_for_tts(response_text)
+                    await ws.send_json({"type": "status", "state": "speaking"})
+                    audio = await synthesize_speech(tts)
+                    if audio:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
+                    else:
+                        await ws.send_json({"type": "text", "text": response_text})
+                        await ws.send_json({"type": "status", "state": "idle"})
                 log.info(f"JARVIS: {response_text}")
                 last_jarvis_response = response_text
 
