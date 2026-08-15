@@ -23,6 +23,9 @@ data/.jarvis_output.txt
 # Certificates
 *.pem
 
+# Logs
+*.log
+
 # Build
 dist/
 .vite/
