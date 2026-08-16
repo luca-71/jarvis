@@ -17,6 +17,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import memory_vault
+
 log = logging.getLogger("jarvis.memory")
 
 DB_PATH = Path(__file__).parent / "data" / "jarvis.db"
@@ -121,6 +123,7 @@ def remember(
 
     # Retire the superseded memories in the same transaction, so a crash can
     # never leave both the old and the new fact live at once.
+    superseded_ids = []
     for old_id in supersedes or []:
         if old_id == mem_id:
             continue
@@ -129,24 +132,41 @@ def remember(
             continue
         conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (old_id,))
         conn.execute("DELETE FROM memories WHERE id = ?", (old_id,))
+        superseded_ids.append(old_id)
         log.info(f"Superseded memory #{old_id}: {row['content'][:60]}")
 
     conn.commit()
     conn.close()
     log.info(f"Stored memory [{mem_type}]: {content[:60]}")
+
+    # Vault mirror is best-effort and off SQLite's transaction — a write here
+    # failing (or being skipped, unconfigured) must never affect the memory
+    # that already committed above.
+    try:
+        for old_id in superseded_ids:
+            memory_vault.mirror_forget(old_id)
+        memory_vault.mirror_remember(mem_id, mem_type, content)
+    except Exception as e:
+        log.warning(f"Vault mirror failed for memory #{mem_id}: {e}")
+
     return mem_id
 
 
 def forget(mem_id: int) -> bool:
     """Delete one memory outright. Returns whether it existed."""
     conn = _get_db()
-    row = conn.execute("SELECT content FROM memories WHERE id = ?", (mem_id,)).fetchone()
+    row = conn.execute("SELECT content, type FROM memories WHERE id = ?", (mem_id,)).fetchone()
     if row:
         conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (mem_id,))
         conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
         conn.commit()
         log.info(f"Forgot memory #{mem_id}: {row['content'][:60]}")
     conn.close()
+    if row:
+        try:
+            memory_vault.mirror_forget(mem_id, row["type"])
+        except Exception as e:
+            log.warning(f"Vault mirror removal failed for memory #{mem_id}: {e}")
     return bool(row)
 
 
