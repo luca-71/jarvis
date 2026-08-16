@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1200,10 +1201,33 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
         if not full_response or full_response.startswith("Hit a problem") or full_response.startswith("That's taking"):
             dispatch_registry.update_status(dispatch_id, "failed" if full_response else "timeout", response=full_response or "")
             msg = phrase("build.issue", project=project_name, detail=full_response[:150] if full_response else "No response received.")
+            already_spoken = False
+        elif not anthropic_client:
+            msg = phrase("build.done", project=project_name, summary=full_response[:200])
+            already_spoken = False
         else:
-            # Summarize via Haiku — don't read word for word
-            if anthropic_client:
-                try:
+            summary_system = (
+                "You are JARVIS reporting back on what you found or built in a project. "
+                "Speak in first person — 'I found', 'I built', 'I reviewed'. "
+                "Start with 'Sir, ' to get the user's attention. "
+                "Be specific but concise — highlight the key findings or actions taken. "
+                "If there are multiple items, give the count and top 2-3 briefly. "
+                "End by asking how the user wants to proceed. "
+                "NEVER read out URLs or localhost addresses. NEVER say 'Claude Code'. "
+                "2-3 sentences max. No markdown. Natural spoken voice."
+                + _language_directive()
+            )
+            summary_messages = [{"role": "user", "content": f"Project: {project_name}\nClaude Code reported:\n{full_response[:3000]}"}]
+            # A recent user turn means the audio channel is busy. Decided
+            # up front — streaming speaks as it goes rather than only at
+            # the end, so it has to know before it starts, not after.
+            skip_audio = bool(voice_state and time.time() - voice_state["last_user_time"] < 3)
+            try:
+                if ws and not skip_audio:
+                    # Speaks each sentence as it streams in — see _stream_and_speak.
+                    msg = await _stream_and_speak(ws, "claude-haiku-4-5-20251001", 700, summary_system, summary_messages)
+                    already_spoken = True
+                else:
                     summary = await anthropic_client.messages.create(
                         model="claude-haiku-4-5-20251001",
                         # Sized for the spoken summary in any language, not just
@@ -1215,28 +1239,21 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                         # still caps length at "2-3 sentences"; this is the
                         # backstop for when the content itself won't fit that.
                         max_tokens=700,
-                        system=(
-                            "You are JARVIS reporting back on what you found or built in a project. "
-                            "Speak in first person — 'I found', 'I built', 'I reviewed'. "
-                            "Start with 'Sir, ' to get the user's attention. "
-                            "Be specific but concise — highlight the key findings or actions taken. "
-                            "If there are multiple items, give the count and top 2-3 briefly. "
-                            "End by asking how the user wants to proceed. "
-                            "NEVER read out URLs or localhost addresses. NEVER say 'Claude Code'. "
-                            "2-3 sentences max. No markdown. Natural spoken voice."
-                            + _language_directive()
-                        ),
-                        messages=[{"role": "user", "content": f"Project: {project_name}\nClaude Code reported:\n{full_response[:3000]}"}],
+                        system=summary_system,
+                        messages=summary_messages,
                     )
-                    msg = summary.content[0].text
-                except Exception:
-                    msg = phrase("build.finished", project=project_name, summary=full_response[:200])
-            else:
-                msg = phrase("build.done", project=project_name, summary=full_response[:200])
+                    msg = next((b.text for b in summary.content if b.type == "text"), "") or phrase("build.finished", project=project_name, summary=full_response[:200])
+                    already_spoken = False
+            except Exception:
+                msg = phrase("build.finished", project=project_name, summary=full_response[:200])
+                already_spoken = False
 
-        # Speak the result — skip if user has spoken recently to avoid audio collision
+        # Speak the result — already done above if streamed; otherwise skip
+        # if the user has spoken recently, to avoid audio collision.
         log.info(f"Dispatch summary for {project_name}: {msg[:100]}")
-        if voice_state and time.time() - voice_state["last_user_time"] < 3:
+        if already_spoken:
+            pass
+        elif voice_state and time.time() - voice_state["last_user_time"] < 3:
             log.info(f"Skipping dispatch audio for {project_name} — user spoke recently")
             # Result is still stored in history below so JARVIS can reference it
         else:
@@ -1383,6 +1400,74 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
     except Exception as e:
         log.error(f"TTS error: {e}")
         return None
+
+
+# A sentence boundary: terminal punctuation followed by whitespace. Simple on
+# purpose — this only needs to catch the common case well enough to start
+# speaking early; an occasional missed split just means that sentence waits
+# for the next one, same as not streaming at all.
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?]+[\s]+")
+
+
+def _pop_complete_sentences(buf: str) -> tuple[list[str], str]:
+    """Split complete sentences off the front of a streaming text buffer.
+
+    Returns (sentences_found, remaining_tail). The tail is fed back in on the
+    next delta — a boundary can span two deltas ("...done." | " Sir, ...").
+    """
+    sentences = []
+    while True:
+        m = _SENTENCE_BOUNDARY_RE.search(buf)
+        if not m:
+            break
+        sentences.append(buf[:m.end()].strip())
+        buf = buf[m.end():]
+    return sentences, buf
+
+
+async def _stream_and_speak(ws, model: str, max_tokens: int, system, messages: list[dict]) -> str:
+    """Stream a Claude response, speaking each sentence as soon as it's
+    complete instead of waiting for the whole reply.
+
+    The model keeps generating the next sentence while this one is already
+    being synthesized and played — the overlap is the entire point; a
+    blocking call pays LLM time and TTS time back to back, this pays the
+    slower of the two. Returns the full text, same contract as a blocking
+    messages.create() call, so callers that need it (history, dispatch
+    summaries) don't have to change.
+    """
+    full_text = ""
+    pending = ""
+    spoke_anything = False
+
+    await ws.send_json({"type": "status", "state": "speaking"})
+
+    async def _speak(sentence: str):
+        nonlocal spoke_anything
+        audio = await synthesize_speech(strip_markdown_for_tts(sentence))
+        try:
+            if audio:
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": full_text})
+            else:
+                await ws.send_json({"type": "text", "text": full_text})
+            spoke_anything = True
+        except Exception as e:
+            log.error(f"Streamed speech send failed: {e}")
+
+    async with anthropic_client.messages.stream(
+        model=model, max_tokens=max_tokens, system=system, messages=messages,
+    ) as stream:
+        async for delta in stream.text_stream:
+            full_text += delta
+            pending += delta
+            sentences, pending = _pop_complete_sentences(pending)
+            for sentence in sentences:
+                await _speak(sentence)
+
+    if pending.strip():
+        await _speak(pending.strip())
+
+    return full_text
 
 
 # ---------------------------------------------------------------------------
@@ -1543,10 +1628,11 @@ dispatch_registry = DispatchRegistry()
 # Usage tracking — logs every call with timestamp, persists to disk
 _USAGE_FILE = Path(__file__).parent / "data" / "usage_log.jsonl"
 _session_start = time.time()
-_session_tokens = {"input": 0, "output": 0, "api_calls": 0, "tts_calls": 0}
+_session_tokens = {"input": 0, "output": 0, "api_calls": 0, "tts_calls": 0, "cache_read": 0, "cache_write": 0}
 
 
-def _append_usage_entry(input_tokens: int, output_tokens: int, call_type: str = "api"):
+def _append_usage_entry(input_tokens: int, output_tokens: int, call_type: str = "api",
+                         cache_read: int = 0, cache_write: int = 0):
     """Append a usage entry with timestamp to the log file."""
     try:
         _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1557,6 +1643,8 @@ def _append_usage_entry(input_tokens: int, output_tokens: int, call_type: str = 
             "type": call_type,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
         }
         with open(_USAGE_FILE, "a") as f:
             f.write(_json.dumps(entry) + "\n")
@@ -1567,7 +1655,8 @@ def _append_usage_entry(input_tokens: int, output_tokens: int, call_type: str = 
 def _get_usage_for_period(seconds: float | None = None) -> dict:
     """Sum usage from the log file for a time period. None = all time."""
     import json as _json
-    totals = {"input_tokens": 0, "output_tokens": 0, "api_calls": 0, "tts_calls": 0}
+    totals = {"input_tokens": 0, "output_tokens": 0, "api_calls": 0, "tts_calls": 0,
+              "cache_read_tokens": 0, "cache_write_tokens": 0}
     cutoff = (time.time() - seconds) if seconds else 0
     try:
         if _USAGE_FILE.exists():
@@ -1578,6 +1667,10 @@ def _get_usage_for_period(seconds: float | None = None) -> dict:
                 if entry["ts"] >= cutoff:
                     totals["input_tokens"] += entry.get("input_tokens", 0)
                     totals["output_tokens"] += entry.get("output_tokens", 0)
+                    # Absent on entries logged before cache tracking existed —
+                    # 0 is the correct read for those, not a placeholder.
+                    totals["cache_read_tokens"] += entry.get("cache_read_tokens", 0)
+                    totals["cache_write_tokens"] += entry.get("cache_write_tokens", 0)
                     if entry.get("type") == "tts":
                         totals["tts_calls"] += 1
                     else:
@@ -1587,8 +1680,28 @@ def _get_usage_for_period(seconds: float | None = None) -> dict:
     return totals
 
 
-def _cost_from_tokens(input_t: int, output_t: int) -> float:
-    return (input_t / 1_000_000) * 0.80 + (output_t / 1_000_000) * 4.00
+# List price for the one model that ever calls track_usage() — generate_response()
+# on claude-sonnet-5 (see its model= there). Deliberately the list price, not
+# the 2026-08-31 intro discount: a rate that quietly goes stale on a date is
+# the same class of bug this replaces, just with a fuse on it.
+_SONNET_5_INPUT_PER_M = 3.00
+_SONNET_5_OUTPUT_PER_M = 15.00
+# Cache economics (see shared/prompt-caching.md): reads are ~0.1x base input
+# price, writes are ~1.25x for the 5-minute TTL this codebase uses (no ttl
+# override on the cache_control blocks). Both are separate from — and were
+# previously invisible next to — plain input_tokens, which is why cost looked
+# lower than actual spend whenever a write happened.
+_CACHE_READ_MULTIPLIER = 0.1
+_CACHE_WRITE_MULTIPLIER = 1.25
+
+
+def _cost_from_tokens(input_t: int, output_t: int, cache_read_t: int = 0, cache_write_t: int = 0) -> float:
+    return (
+        (input_t / 1_000_000) * _SONNET_5_INPUT_PER_M
+        + (cache_read_t / 1_000_000) * _SONNET_5_INPUT_PER_M * _CACHE_READ_MULTIPLIER
+        + (cache_write_t / 1_000_000) * _SONNET_5_INPUT_PER_M * _CACHE_WRITE_MULTIPLIER
+        + (output_t / 1_000_000) * _SONNET_5_OUTPUT_PER_M
+    )
 
 
 def track_usage(response):
@@ -1596,17 +1709,23 @@ def track_usage(response):
     usage = getattr(response, "usage", None)
     inp = getattr(usage, "input_tokens", 0) or 0
     out = getattr(usage, "output_tokens", 0) or 0
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+
     _session_tokens["input"] += inp
     _session_tokens["output"] += out
+    _session_tokens["cache_read"] += cache_read
+    _session_tokens["cache_write"] += cache_write
     _session_tokens["api_calls"] += 1
-    _append_usage_entry(inp, out, "api")
+    # cache_read/cache_write used to be logged (below) but never persisted —
+    # the usage log and every cost estimate built on it silently ignored
+    # both, understating real spend on every call that wrote or read cache.
+    _append_usage_entry(inp, out, "api", cache_read=cache_read, cache_write=cache_write)
 
     # A silent cache invalidator (a byte changed somewhere in the prefix) is
     # otherwise invisible — the request just succeeds at full price. Logging
     # every read is noisy; logging a miss on a call that expects to cache is
     # the useful signal, since it should be rare after the first request.
-    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
     log.info(f"Usage: input={inp} output={out} cache_read={cache_read} cache_write={cache_write}")
     if cache_write and not cache_read:
         log.warning(
@@ -1624,9 +1743,9 @@ def get_usage_summary() -> str:
     week = _get_usage_for_period(86400 * 7)
     all_time = _get_usage_for_period(None)
 
-    session_cost = _cost_from_tokens(session["input"], session["output"])
-    today_cost = _cost_from_tokens(today["input_tokens"], today["output_tokens"])
-    all_cost = _cost_from_tokens(all_time["input_tokens"], all_time["output_tokens"])
+    session_cost = _cost_from_tokens(session["input"], session["output"], session["cache_read"], session["cache_write"])
+    today_cost = _cost_from_tokens(today["input_tokens"], today["output_tokens"], today["cache_read_tokens"], today["cache_write_tokens"])
+    all_cost = _cost_from_tokens(all_time["input_tokens"], all_time["output_tokens"], all_time["cache_read_tokens"], all_time["cache_write_tokens"])
 
     parts = [f"This session: {uptime_min} minutes, {session['api_calls']} calls, ${session_cost:.2f}."]
 
@@ -1940,10 +2059,10 @@ async def api_usage():
     all_time = _get_usage_for_period(None)
     return {
         "session": {**_session_tokens, "uptime_seconds": uptime},
-        "today": {**today, "cost_usd": round(_cost_from_tokens(today["input_tokens"], today["output_tokens"]), 4)},
-        "week": {**week, "cost_usd": round(_cost_from_tokens(week["input_tokens"], week["output_tokens"]), 4)},
-        "month": {**month, "cost_usd": round(_cost_from_tokens(month["input_tokens"], month["output_tokens"]), 4)},
-        "all_time": {**all_time, "cost_usd": round(_cost_from_tokens(all_time["input_tokens"], all_time["output_tokens"]), 4)},
+        "today": {**today, "cost_usd": round(_cost_from_tokens(today["input_tokens"], today["output_tokens"], today["cache_read_tokens"], today["cache_write_tokens"]), 4)},
+        "week": {**week, "cost_usd": round(_cost_from_tokens(week["input_tokens"], week["output_tokens"], week["cache_read_tokens"], week["cache_write_tokens"]), 4)},
+        "month": {**month, "cost_usd": round(_cost_from_tokens(month["input_tokens"], month["output_tokens"], month["cache_read_tokens"], month["cache_write_tokens"]), 4)},
+        "all_time": {**all_time, "cost_usd": round(_cost_from_tokens(all_time["input_tokens"], all_time["output_tokens"], all_time["cache_read_tokens"], all_time["cache_write_tokens"]), 4)},
     }
 
 
