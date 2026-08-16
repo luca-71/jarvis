@@ -34,6 +34,7 @@ from typing import Optional
 
 import anthropic
 import httpx
+import psutil
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -429,8 +430,38 @@ def _get_weather_location() -> Optional[dict]:
     return _cached_weather_location
 
 
-def _fetch_weather_string_sync() -> Optional[str]:
-    """Sync weather fetch — safe to call from a threaded worker."""
+# WMO weather codes (the "weathercode" field Open-Meteo returns) collapsed to
+# the handful of conditions worth a one-word label on a small HUD tile — the
+# full table has ~30 entries distinguishing e.g. "slight" vs "heavy" rain,
+# which is exactly the kind of nuance the spoken weather line already carries
+# and a 2-word widget doesn't need to repeat.
+#
+# Maps to a phrase() key, not raw text — the label is fetched once every 30s
+# on a background thread, but must read out in whatever language is active
+# *when a client asks*, which can change between fetches. Resolving through
+# phrase() at request time (see /api/hud/stats) keeps the two in sync the same
+# way the rest of the app's spoken text already does.
+_WEATHER_CODE_PHRASE_KEYS = {
+    0: "weather.clear", 1: "weather.mostly_clear", 2: "weather.partly_cloudy", 3: "weather.overcast",
+    45: "weather.fog", 48: "weather.fog",
+    51: "weather.drizzle", 53: "weather.drizzle", 55: "weather.drizzle",
+    56: "weather.freezing_drizzle", 57: "weather.freezing_drizzle",
+    61: "weather.rain", 63: "weather.rain", 65: "weather.heavy_rain",
+    66: "weather.freezing_rain", 67: "weather.freezing_rain",
+    71: "weather.snow", 73: "weather.snow", 75: "weather.heavy_snow", 77: "weather.snow_grains",
+    80: "weather.rain_showers", 81: "weather.rain_showers", 82: "weather.violent_showers",
+    85: "weather.snow_showers", 86: "weather.snow_showers",
+    95: "weather.thunderstorm", 96: "weather.thunderstorm", 99: "weather.thunderstorm",
+}
+
+
+def _fetch_weather_sync() -> Optional[dict]:
+    """Sync weather fetch — safe to call from a threaded worker.
+
+    The one network call backs both the spoken line (`_fetch_weather_string_sync`)
+    and the structured HUD tile (`/api/hud/stats`), so the two can never disagree
+    about what the weather currently is.
+    """
     location = _get_weather_location()
     if not location:
         return None
@@ -445,17 +476,31 @@ def _fetch_weather_string_sync() -> Optional[str]:
         url = (
             "https://api.open-meteo.com/v1/forecast"
             f"?latitude={location['latitude']}&longitude={location['longitude']}"
-            f"&current=temperature_2m,weathercode&temperature_unit={unit}"
+            f"&current=temperature_2m,relative_humidity_2m,weathercode&temperature_unit={unit}"
         )
         with _ureq.urlopen(url, timeout=3) as resp:
             current = json.loads(resp.read()).get("current", {})
         temp = current.get("temperature_2m")
         if temp is None:
             return None
-        return f"Current weather in {location['label']}: {temp}{unit_symbol}"
+        code = current.get("weathercode")
+        return {
+            "label": location["label"],
+            "temp": temp,
+            "unit_symbol": unit_symbol,
+            "humidity": current.get("relative_humidity_2m"),
+            "condition_key": _WEATHER_CODE_PHRASE_KEYS.get(code, "weather.unknown"),
+        }
     except Exception as e:
         log.debug(f"Weather fetch failed: {e}")
         return None
+
+
+def _fetch_weather_string_sync() -> Optional[str]:
+    data = _fetch_weather_sync()
+    if data is None:
+        return None
+    return f"Current weather in {data['label']}: {data['temp']}{data['unit_symbol']}"
 
 
 # ---------------------------------------------------------------------------
@@ -1171,9 +1216,13 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                         model="claude-haiku-4-5-20251001",
                         # Sized for the spoken summary in any language, not just
                         # English: the same two sentences cost noticeably more
-                        # tokens in Italian, and the old ceiling cut them mid-word.
-                        # The prompt caps the length; this is only a safety net.
-                        max_tokens=400,
+                        # tokens in Italian. 400 wasn't enough of a margin —
+                        # a genuinely two-part report (this dispatch reviewed a
+                        # plan with two implementation stages) ran past it and
+                        # got cut off mid-sentence, live, on screen. The prompt
+                        # still caps length at "2-3 sentences"; this is the
+                        # backstop for when the content itself won't fit that.
+                        max_tokens=700,
                         system=(
                             "You are JARVIS reporting back on what you found or built in a project. "
                             "Speak in first person — 'I found', 'I built', 'I reviewed'. "
@@ -1472,7 +1521,17 @@ async def generate_response(
             messages=messages,
         )
         track_usage(response)
-        return response.content[0].text
+        # Sonnet 5 has adaptive thinking on by default (this call never sets
+        # `thinking`, which means "adaptive", not "off" — that changed moving
+        # off Haiku). When it thinks, content[0] is a ThinkingBlock with no
+        # .text at all, and every voice turn started throwing until this was
+        # caught live: content[0].text worked in testing right up until a
+        # request that actually triggered thinking.
+        text = next((b.text for b in response.content if b.type == "text"), "")
+        if not text:
+            log.warning(f"No text block in response (stop_reason={response.stop_reason})")
+            return "Apologies, sir. I'm having trouble connecting to my language systems."
+        return text
     except Exception as e:
         log.error(f"LLM error: {e}")
         return "Apologies, sir. I'm having trouble connecting to my language systems."
@@ -1593,6 +1652,7 @@ _ctx_cache = {
     "calendar": "No calendar data yet.",
     "mail": "No mail data yet.",
     "weather": "Weather data unavailable.",
+    "weather_data": None,  # structured form for the HUD tile; see _fetch_weather_sync
 }
 
 
@@ -1655,9 +1715,11 @@ return windowList
 
             # Weather — refresh every loop (30s is fine, API is fast).
             # Location resolves from env override → cached lookup → IP geolocation.
-            weather_string = _fetch_weather_string_sync()
-            if weather_string:
-                _ctx_cache["weather"] = weather_string
+            # One fetch backs both the spoken cache and the HUD tile.
+            weather_data = _fetch_weather_sync()
+            if weather_data:
+                _ctx_cache["weather"] = f"Current weather in {weather_data['label']}: {weather_data['temp']}{weather_data['unit_symbol']}"
+                _ctx_cache["weather_data"] = weather_data
 
             time.sleep(30)
 
@@ -1686,6 +1748,22 @@ def set_quiet_mode(quiet: bool):
     if quiet != _quiet_mode:
         log.info(f"Quiet mode {'on' if quiet else 'off'}")
     _quiet_mode = quiet
+
+
+# ---------------------------------------------------------------------------
+# Activity log — the HUD's terminal-style feed of what JARVIS is doing
+# ---------------------------------------------------------------------------
+# Distinct from _announce below: this is never spoken and never blocks on a
+# reply. It's a silent, one-line "what just happened" for a UI that renders
+# it, nothing more — so unlike a spoken announcement there's no reason to
+# hold one back when nobody is listening. A missed activity line is not a
+# missed timer; the next one arrives in seconds either way.
+
+
+async def _notify_activity(text: str):
+    if not text or not task_manager._websockets:
+        return
+    await task_manager._notify({"type": "activity", "text": text, "ts": time.time()})
 
 
 # ---------------------------------------------------------------------------
@@ -1732,6 +1810,7 @@ async def _on_timer_fired(timer: "timers.Timer", late: bool):
         key = "timer.done_late" if timer.label else "timer.done_late_plain"
     else:
         key = "timer.done" if timer.label else "timer.done_plain"
+    await _notify_activity(f"Timer done: {timer.label or 'timer'}")
     await _announce(phrase(key, label=timer.label))
 
 
@@ -1739,6 +1818,7 @@ async def _on_battery_low(state: "battery.BatteryState", level: int):
     key = {20: "battery.low", 10: "battery.very_low", 5: "battery.critical"}.get(
         level, "battery.low"
     )
+    await _notify_activity(f"Battery at {state.percent}%")
     await _announce(phrase(key))
 
 
@@ -1766,6 +1846,12 @@ async def lifespan(application: FastAPI):
     # are used, which is what happened before this existed anyway.
     asyncio.create_task(_refresh_phrases())
     cached_projects = []
+
+    # psutil.cpu_percent(interval=None) measures the delta since its last
+    # call — the first call in a process has nothing to diff against and
+    # returns 0.0 unconditionally. Priming it here means the HUD's first
+    # real poll reads a real number instead of a false "0% load".
+    psutil.cpu_percent(interval=None)
 
     # Start context refresh in a separate thread (never touches event loop)
     _refresh_context_sync()
@@ -1800,6 +1886,40 @@ app.add_middleware(
 @app.get("/api/health")
 async def health():
     return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
+
+
+# Soft ceiling the token gauge fills against — not a cap, just a scale. A
+# conversational Sonnet assistant spends far less per day than a coding
+# agent, so the coding-oriented defaults elsewhere in this file would leave
+# the gauge pinned near empty; override with JARVIS_DAILY_TOKEN_TARGET.
+_DAILY_TOKEN_TARGET = int(os.getenv("JARVIS_DAILY_TOKEN_TARGET", "150000"))
+
+
+@app.get("/api/hud/stats")
+async def hud_stats():
+    """Live numbers for the HUD tiles — polled, not pushed, since CPU/memory
+    read cheaply and a 5s-stale gauge is indistinguishable from a fresh one."""
+    today = _get_usage_for_period(86400)
+    tokens_today = today["input_tokens"] + today["output_tokens"]
+
+    # Resolved into the active language here, at request time, rather than
+    # baked into the cache on the 30s background fetch — a language switch
+    # must not have to wait up to 30s for the next fetch to take effect.
+    weather = _ctx_cache.get("weather_data")
+    if weather:
+        # condition_key stays alongside the translated condition text — the
+        # frontend picks a weather emoji from it, and matching against
+        # translated text broke the moment "Clear" became "Sereno".
+        weather = {**weather, "condition": phrase(weather["condition_key"])}
+
+    return {
+        "cpu_percent": psutil.cpu_percent(interval=None),
+        "memory_percent": psutil.virtual_memory().percent,
+        "tokens_today": tokens_today,
+        "tokens_target": _DAILY_TOKEN_TARGET,
+        "tokens_percent": min(100, round(100 * tokens_today / _DAILY_TOKEN_TARGET)),
+        "weather": weather,
+    }
 
 
 @app.get("/api/tts-test")
@@ -2380,6 +2500,7 @@ async def voice_handler(ws: WebSocket):
     messages_since_last_summary: int = 0
 
     log.info("Voice WebSocket connected")
+    await _notify_activity("JARVIS online")
 
     try:
         # ── Greeting — always start in conversation mode ──
@@ -2433,6 +2554,43 @@ async def voice_handler(ws: WebSocket):
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
                 else:
                     await ws.send_json({"type": "text", "text": response_text})
+                continue
+
+            # ── Quick actions: HUD buttons that skip the LLM entirely ──
+            # These exist so a click is a click — routing "check my screen"
+            # through the model just to have it emit [ACTION:SCREEN] would
+            # spend a request answering a question nobody asked in words.
+            if msg.get("type") == "quick_action":
+                action = msg.get("action")
+                if action == "vision":
+                    await _notify_activity("Checking screen")
+                    asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
+                elif action == "terminal":
+                    await _notify_activity("Opening terminal")
+                    asyncio.create_task(_execute_open_terminal())
+                elif action == "calendar":
+                    await _notify_activity("Checking calendar")
+                    asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
+                elif action == "mail":
+                    await _notify_activity("Checking mail")
+                    asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
+                elif action == "new_conversation":
+                    # Plain local reassignment, not a reset endpoint — this is
+                    # one WebSocket's own turn history, so there is nothing
+                    # elsewhere that needs to know it happened.
+                    history = []
+                    session_summary = ""
+                    summary_update_pending = False
+                    messages_since_last_summary = 0
+                    last_jarvis_response = ""
+                    await _notify_activity("New conversation")
+                    await ws.send_json({"type": "text", "text": phrase("hud.new_conversation")})
+                elif action == "dispatch_status":
+                    status = dispatch_registry.format_for_prompt()
+                    await _notify_activity("Checked dispatch status")
+                    await ws.send_json({"type": "text", "text": status})
+                else:
+                    log.warning(f"Unknown quick_action: {action!r}")
                 continue
 
             if msg.get("type") != "transcript" or not msg.get("isFinal"):
@@ -2696,10 +2854,12 @@ async def voice_handler(ws: WebSocket):
 
                                     # Register and dispatch
                                     did = dispatch_registry.register(name, path, target)
+                                    await _notify_activity(f"Building {name}")
                                     asyncio.create_task(
                                         _execute_prompt_project(name, target, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state)
                                     )
                                 elif embedded_action["action"] == "browse":
+                                    await _notify_activity(f"Opening {embedded_action['target']}")
                                     asyncio.create_task(_execute_browse(embedded_action["target"]))
                                 elif embedded_action["action"] == "research":
                                     # Research enters work mode too
@@ -2707,6 +2867,7 @@ async def voice_handler(ws: WebSocket):
                                     path = str(Path.home() / "Desktop" / name)
                                     os.makedirs(path, exist_ok=True)
                                     await work_session.start(path)
+                                    await _notify_activity(f"Researching: {embedded_action['target'][:60]}")
                                     asyncio.create_task(
                                         self_work_and_notify(work_session, embedded_action["target"], ws)
                                     )
@@ -2719,7 +2880,7 @@ async def voice_handler(ws: WebSocket):
                                         proj_name = proj_name.strip()
                                         prompt = prompt.strip()
                                         # Check for recent completed dispatch before re-dispatching
-                                        recent = dispatch_registry.get_recent_for_project(proj_name)
+                                        recent = dispatch_registry.get_recent_for_project(proj_name, prompt)
                                         if recent and recent.get("summary"):
                                             log.info(f"Using recent dispatch result for {proj_name} instead of re-dispatching")
                                             response_text = recent["summary"]
@@ -2740,6 +2901,7 @@ async def voice_handler(ws: WebSocket):
                                         due = parts[3].strip() if len(parts) > 3 else ""
                                         create_task(title=title, description=desc, priority=priority, due_date=due)
                                         log.info(f"Task created: {title}")
+                                        await _notify_activity(f"Task added: {title}")
                                 elif embedded_action["action"] == "add_note":
                                     target = embedded_action["target"]
                                     if "|||" in target:
@@ -2748,16 +2910,19 @@ async def voice_handler(ws: WebSocket):
                                     else:
                                         create_note(content=target)
                                     log.info(f"Note created")
+                                    await _notify_activity("Note saved")
                                 elif embedded_action["action"] == "complete_task":
                                     try:
                                         task_id = int(embedded_action["target"].strip())
                                         complete_task(task_id)
                                         log.info(f"Task {task_id} completed")
+                                        await _notify_activity(f"Task #{task_id} completed")
                                     except ValueError:
                                         pass
                                 elif embedded_action["action"] == "remember":
                                     remember(embedded_action["target"].strip(), mem_type="fact", importance=7)
                                     log.info(f"Memory stored: {embedded_action['target'][:60]}")
+                                    await _notify_activity("Memory stored")
                                 elif embedded_action["action"] == "timer":
                                     target = embedded_action["target"]
                                     raw_seconds, _, label = target.partition("|||")
@@ -2771,23 +2936,31 @@ async def voice_handler(ws: WebSocket):
                                     else:
                                         timers.create_timer(seconds, label.strip())
                                         timer_service.notify()
+                                        await _notify_activity(f"Timer set: {label.strip() or f'{int(seconds)}s'}")
                                 elif embedded_action["action"] == "cancel_timer":
                                     cancelled = timers.cancel_matching(embedded_action["target"])
                                     timer_service.notify()
                                     log.info(f"Cancelled {len(cancelled)} timer(s)")
+                                    if cancelled:
+                                        await _notify_activity(f"Cancelled {len(cancelled)} timer(s)")
                                 elif embedded_action["action"] == "create_note":
                                     target = embedded_action["target"]
                                     if "|||" in target:
                                         title, _, body = target.partition("|||")
                                         asyncio.create_task(create_apple_note(title.strip(), body.strip()))
                                         log.info(f"Apple Note created: {title.strip()}")
+                                        await _notify_activity(f"Note created: {title.strip()}")
                                     else:
                                         asyncio.create_task(create_apple_note("JARVIS Note", target))
+                                        await _notify_activity("Note created")
                                 elif embedded_action["action"] == "screen":
+                                    await _notify_activity("Checking screen")
                                     asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "calendar":
+                                    await _notify_activity("Checking calendar")
                                     asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "mail":
+                                    await _notify_activity("Checking mail")
                                     asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "vault":
                                     _query = embedded_action["target"].strip()
@@ -3044,6 +3217,7 @@ async def api_settings_status():
         "task_count": task_count,
         "server_port": 8340,
         "uptime_seconds": int(time.time() - _session_start),
+        "tts_backend": _current_tts_backend(),
         "env_keys_set": {
             "anthropic": bool(env_dict.get("ANTHROPIC_API_KEY", "").strip() and env_dict.get("ANTHROPIC_API_KEY", "") != "your-anthropic-api-key-here"),
             "fish_audio": bool(env_dict.get("FISH_API_KEY", "").strip() and env_dict.get("FISH_API_KEY", "") != _FISH_KEY_PLACEHOLDER),

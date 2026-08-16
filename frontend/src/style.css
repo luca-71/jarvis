@@ -532,3 +532,352 @@ body.text-open #jarvis-caption {
 body.text-open #status-text {
   opacity: 0;
 }
+
+/* ---------------------------------------------------------------------------
+   HUD — system/weather tiles (top left) and activity/actions (bottom left).
+
+   Left side is deliberately where all of this lives: the right corner already
+   carries mute + menu, and the bottom-center strip is caption/status/text-bar
+   territory. Left was the one edge nothing had claimed yet.
+
+   Every panel reuses the #text-bar glass-card recipe (same background, blur,
+   border, radius) so the HUD reads as one visual system with the rest of the
+   interface rather than a bolted-on dashboard.
+   --------------------------------------------------------------------------- */
+
+.hud-panel {
+  background: rgba(8, 12, 20, 0.82);
+  border: 1px solid rgba(14, 165, 233, 0.22);
+  border-radius: 12px;
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  padding: 12px 16px;
+}
+
+.hud-panel-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  color: rgba(14, 165, 233, 0.55);
+  margin-bottom: 8px;
+}
+
+#hud-top-left {
+  position: fixed;
+  top: 24px;
+  left: 24px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 190px;
+  /* This column and #hud-bottom-left are two independent fixed containers,
+     one anchored to the top-left corner and one to the bottom-left, each
+     sized by its own content. Neither knows how tall the other is, so on a
+     short window — or once the connected-tools list or activity feed grows —
+     nothing stops them from growing into each other. Capping each to under
+     half the viewport, with its own scrollbar past that, is what makes
+     "growing into each other" impossible rather than just unlikely. */
+  max-height: 44vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(14, 165, 233, 0.35) transparent;
+  /* A HUD reporting on a machine that hasn't answered once yet is noise, not
+     signal — hidden until the first /api/hud/stats poll actually lands. */
+  opacity: 0;
+  transition: opacity 0.6s ease;
+  pointer-events: none;
+}
+
+#hud-top-left.ready {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+#hud-top-left::-webkit-scrollbar {
+  width: 4px;
+}
+
+#hud-top-left::-webkit-scrollbar-thumb {
+  background: rgba(14, 165, 233, 0.35);
+  border-radius: 2px;
+}
+
+/* -- System gauges -- */
+
+.hud-gauge {
+  display: grid;
+  grid-template-columns: 46px 1fr 30px;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.hud-gauge:first-of-type {
+  margin-top: 0;
+}
+
+.hud-gauge-label {
+  font-size: 10px;
+  color: rgba(219, 238, 252, 0.5);
+  letter-spacing: 0.3px;
+}
+
+.hud-gauge-track {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(14, 165, 233, 0.12);
+  overflow: hidden;
+}
+
+.hud-gauge-fill {
+  height: 100%;
+  width: 0%;
+  background: rgba(14, 165, 233, 0.75);
+  border-radius: 2px;
+  transition: width 0.6s ease;
+}
+
+/* A gauge nearing its ceiling is the one moment a glance should catch it. */
+.hud-gauge[data-level="high"] .hud-gauge-fill {
+  background: rgba(240, 140, 60, 0.85);
+}
+.hud-gauge[data-level="critical"] .hud-gauge-fill {
+  background: rgba(230, 70, 70, 0.9);
+}
+
+.hud-gauge-value {
+  font-size: 10px;
+  color: rgba(219, 238, 252, 0.65);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* -- Weather -- */
+
+#hud-weather-body {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.hud-weather-temp {
+  font-size: 22px;
+  font-weight: 300;
+  color: rgba(219, 238, 252, 0.92);
+}
+
+.hud-weather-detail {
+  font-size: 11px;
+  color: rgba(219, 238, 252, 0.5);
+  line-height: 1.5;
+}
+
+/* -- Bottom-left cluster: quick actions only -- */
+
+#hud-bottom-left {
+  position: fixed;
+  bottom: 24px;
+  left: 24px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 220px;
+}
+
+/* -- Bottom-right cluster: command shortcuts + activity feed --
+   Mirrors #hud-top-left's height cap — see the comment there. Capped from the
+   bottom edge, so it's the top of this cluster (Commands) that scrolls out of
+   view first, not the activity feed anchored at the bottom. */
+
+#hud-bottom-right {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column-reverse; /* activity stays pinned to the bottom edge */
+  gap: 12px;
+  width: 220px;
+  max-height: 44vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(14, 165, 233, 0.35) transparent;
+}
+
+#hud-bottom-right::-webkit-scrollbar {
+  width: 4px;
+}
+
+#hud-bottom-right::-webkit-scrollbar-thumb {
+  background: rgba(14, 165, 233, 0.35);
+  border-radius: 2px;
+}
+
+#hud-actions {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+}
+
+.hud-action {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid rgba(14, 165, 233, 0.18);
+  border-radius: 8px;
+  padding: 8px 4px;
+  color: rgba(219, 238, 252, 0.6);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.hud-action:hover {
+  background: rgba(14, 165, 233, 0.1);
+  border-color: rgba(14, 165, 233, 0.4);
+  color: rgba(219, 238, 252, 0.95);
+}
+
+.hud-action span {
+  font-size: 9px;
+  letter-spacing: 0.3px;
+}
+
+/* Voice reflects live mute state — same red the mic button already uses. */
+.hud-action[data-action="voice"].muted {
+  border-color: rgba(230, 70, 70, 0.5);
+  color: rgba(240, 140, 140, 0.9);
+}
+
+#hud-activity {
+  max-height: 160px;
+  overflow: hidden;
+}
+
+#hud-activity-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hud-activity-line {
+  font-size: 11px;
+  line-height: 1.4;
+  color: rgba(219, 238, 252, 0.75);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity 2s ease;
+}
+
+.hud-activity-line::before {
+  content: "›";
+  color: rgba(14, 165, 233, 0.6);
+  margin-right: 6px;
+}
+
+/* Aged out but not yet pruned — see HUD_ACTIVITY_MAX in main.ts. */
+.hud-activity-line.stale {
+  opacity: 0.35;
+}
+
+/* Narrow viewports: the HUD would collide with the orb and the text bar
+   before either gets a chance to be readable. Hide it rather than crowd. */
+@media (max-width: 860px) {
+  #hud-top-left,
+  #hud-bottom-left,
+  #hud-bottom-right {
+    display: none;
+  }
+}
+
+/* -- Status card: uptime, voice backend, connected integrations -- */
+
+.hud-status-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-top: 6px;
+}
+
+.hud-status-row:first-of-type {
+  margin-top: 0;
+}
+
+.hud-status-row span:first-child {
+  color: rgba(219, 238, 252, 0.45);
+}
+
+.hud-status-row span:last-child {
+  color: rgba(219, 238, 252, 0.85);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-connected-list {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(14, 165, 233, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.hud-connected-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: rgba(219, 238, 252, 0.5);
+}
+
+/* Reachability is a fact, not a preference — off reads as dim and struck
+   through rather than hidden, so a broken integration is still visible. */
+.hud-connected-item.off {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+
+.hud-connected-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(90, 220, 140, 0.8);
+  flex-shrink: 0;
+}
+
+.hud-connected-item.off .hud-connected-dot {
+  background: rgba(219, 238, 252, 0.3);
+}
+
+/* -- Command shortcuts -- */
+
+.hud-command-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.hud-command {
+  background: transparent;
+  border: 1px solid rgba(14, 165, 233, 0.18);
+  border-radius: 8px;
+  padding: 8px 6px;
+  color: rgba(219, 238, 252, 0.7);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.hud-command:hover {
+  background: rgba(14, 165, 233, 0.1);
+  border-color: rgba(14, 165, 233, 0.4);
+  color: rgba(219, 238, 252, 0.95);
+}

@@ -45,9 +45,14 @@ function showCaption(text: unknown) {
   clearTimeout(captionTimer);
   captionEl.textContent = text;
   captionEl.style.opacity = "1";
-  // Hold long enough to read the line, since a caption may be all the user
-  // gets. Replies are a sentence or two, so length is a fair proxy.
-  const holdMs = Math.min(20000, 4000 + text.length * 60);
+  // Hold long enough to read it, since a caption may be all the user gets —
+  // truer now than when this was written: the Commands panel's "Dispatch
+  // status" can return several paragraphs, not the sentence or two a spoken
+  // reply is limited to. The 60ms/char rate is ~16.7 chars/s, close to a
+  // measured comfortable reading pace; the outer cap is a backstop against
+  // something unbounded slipping through, not a real ceiling — at 90s it
+  // wouldn't bind before ~1400 characters, well past anything this app sends.
+  const holdMs = Math.min(90000, 4000 + text.length * 60);
   captionTimer = window.setTimeout(() => {
     captionEl.style.opacity = "0";
   }, holdMs);
@@ -345,8 +350,264 @@ socket.onMessage((msg) => {
     console.log("[task]", "spawned:", msg.task_id, msg.prompt);
   } else if (type === "task_complete") {
     console.log("[task]", "complete:", msg.task_id, msg.status, msg.summary);
+  } else if (type === "activity") {
+    pushActivity(msg.text as string);
   }
 });
+
+// ---------------------------------------------------------------------------
+// HUD — system/weather tiles (polled) and the activity feed (pushed)
+// ---------------------------------------------------------------------------
+// Two different update strategies for two different kinds of data. CPU,
+// memory and the weather change on their own clock, indifferent to anything
+// JARVIS does — polling every few seconds is the honest model for that, and
+// cheap enough not to matter. Activity is the opposite: it only exists at the
+// instant something happens, so it has to be pushed, not polled for.
+
+const hudTopLeft = document.getElementById("hud-top-left")!;
+const hudWeatherPanel = document.getElementById("hud-weather")!;
+const hudWeatherBody = document.getElementById("hud-weather-body")!;
+const hudActivityList = document.getElementById("hud-activity-list")!;
+
+const HUD_POLL_MS = 5000;
+
+/** Above this fraction of the gauge, a glance should catch it. */
+function gaugeLevel(percent: number): "normal" | "high" | "critical" {
+  if (percent >= 90) return "critical";
+  if (percent >= 75) return "high";
+  return "normal";
+}
+
+function setGauge(name: string, percent: number, valueText: string) {
+  const el = document.querySelector(`.hud-gauge[data-gauge="${name}"]`) as HTMLElement | null;
+  if (!el) return;
+  const clamped = Math.max(0, Math.min(100, percent));
+  const fill = el.querySelector(".hud-gauge-fill") as HTMLElement;
+  const value = el.querySelector(".hud-gauge-value") as HTMLElement;
+  fill.style.width = `${clamped}%`;
+  value.textContent = valueText;
+  const level = gaugeLevel(clamped);
+  if (level === "normal") el.removeAttribute("data-level");
+  else el.setAttribute("data-level", level);
+}
+
+// WMO weather codes collapsed to one glyph — the panel has room for a
+// character, not a sentence; the spoken reply already carries the detail.
+/**
+ * Picks a glyph from `condition_key` (e.g. "weather.mostly_clear"), never
+ * from the displayed `condition` text — that text is translated server-side
+ * via phrase(), so matching English substrings against it works only in
+ * English and silently falls through to the thermometer everywhere else.
+ * condition_key is the one field in HudWeather that phrase() never touches.
+ */
+function weatherEmoji(conditionKey: string): string {
+  if (conditionKey.includes("clear")) return "☀️";
+  if (conditionKey.includes("cloudy") || conditionKey.includes("overcast")) return "☁️";
+  if (conditionKey.includes("fog")) return "🌫️";
+  if (conditionKey.includes("thunderstorm")) return "⛈️";
+  if (conditionKey.includes("snow")) return "🌨️";
+  if (conditionKey.includes("rain") || conditionKey.includes("drizzle") || conditionKey.includes("showers")) return "🌧️";
+  return "🌡️";
+}
+
+interface HudWeather {
+  label: string;
+  temp: number;
+  unit_symbol: string;
+  humidity: number | null;
+  condition: string;
+  condition_key: string;
+}
+
+interface HudStats {
+  cpu_percent: number;
+  memory_percent: number;
+  tokens_today: number;
+  tokens_target: number;
+  tokens_percent: number;
+  weather: HudWeather | null;
+}
+
+async function pollHudStats() {
+  try {
+    const res = await fetch("/api/hud/stats", { signal: AbortSignal.timeout(4000) });
+    if (!res.ok) return;
+    const stats = (await res.json()) as HudStats;
+
+    setGauge("cpu", stats.cpu_percent, `${Math.round(stats.cpu_percent)}%`);
+    setGauge("memory", stats.memory_percent, `${Math.round(stats.memory_percent)}%`);
+    setGauge("tokens", stats.tokens_percent, `${Math.round(stats.tokens_percent)}%`);
+    hudTopLeft.classList.add("ready");
+
+    if (stats.weather) {
+      const w = stats.weather;
+      hudWeatherPanel.style.display = "";
+      hudWeatherBody.innerHTML = "";
+      const tempEl = document.createElement("span");
+      tempEl.className = "hud-weather-temp";
+      tempEl.textContent = `${weatherEmoji(w.condition_key)} ${Math.round(w.temp)}${w.unit_symbol}`;
+      const detailEl = document.createElement("span");
+      detailEl.className = "hud-weather-detail";
+      detailEl.textContent = w.humidity != null ? `${w.condition}\nUmidità ${w.humidity}%` : w.condition;
+      detailEl.style.whiteSpace = "pre-line";
+      hudWeatherBody.appendChild(tempEl);
+      hudWeatherBody.appendChild(detailEl);
+    } else {
+      hudWeatherPanel.style.display = "none";
+    }
+  } catch {
+    // A missed poll is invisible by design — the gauges just hold their last
+    // reading for another 5s, which reads as calm rather than broken.
+  }
+}
+
+pollHudStats();
+setInterval(pollHudStats, HUD_POLL_MS);
+
+// -- Activity feed --
+
+const HUD_ACTIVITY_MAX = 6;
+// Newest first. Each entry ages out of the "fresh" look after a while so the
+// feed reads as a log, not a wall of equally-urgent lines.
+const HUD_ACTIVITY_STALE_MS = 12000;
+
+interface ActivityEntry {
+  text: string;
+  ts: number;
+}
+
+let activityEntries: ActivityEntry[] = [];
+
+function renderActivity() {
+  hudActivityList.innerHTML = "";
+  const now = Date.now();
+  for (const entry of activityEntries) {
+    const line = document.createElement("div");
+    line.className = "hud-activity-line";
+    if (now - entry.ts > HUD_ACTIVITY_STALE_MS) line.classList.add("stale");
+    line.textContent = entry.text;
+    hudActivityList.appendChild(line);
+  }
+}
+
+function pushActivity(text: string) {
+  if (!text) return;
+  activityEntries.unshift({ text, ts: Date.now() });
+  activityEntries = activityEntries.slice(0, HUD_ACTIVITY_MAX);
+  renderActivity();
+}
+
+// Sweep for staleness independent of new arrivals — a feed that only ever
+// re-renders on a new event would freeze mid-fade the moment things go quiet.
+setInterval(renderActivity, 3000);
+
+// -- Quick action buttons --
+
+function sendQuickAction(action: string) {
+  socket.send({ type: "quick_action", action });
+}
+
+document.querySelectorAll<HTMLButtonElement>(".hud-action").forEach((btn) => {
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const action = btn.dataset.action;
+    if (action === "voice") {
+      // Reuse the mic button's own logic rather than re-implement mute —
+      // two toggles maintaining the same boolean independently is how they
+      // end up disagreeing.
+      btnMute.click();
+      btn.classList.toggle("muted", isMuted);
+    } else if (action === "vision" || action === "terminal") {
+      sendQuickAction(action);
+    }
+  });
+});
+
+// Command shortcuts share the exact same quick_action wire format and the
+// exact same server-side handler as the action buttons above — the only
+// difference is which four actions this row happens to trigger.
+document.querySelectorAll<HTMLButtonElement>(".hud-command").forEach((btn) => {
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const command = btn.dataset.command;
+    if (command) sendQuickAction(command);
+  });
+});
+
+// -- Status card: uptime (ticked client-side), voice backend, connected tools --
+
+const hudUptimeEl = document.getElementById("hud-uptime")!;
+const hudVoiceBackendEl = document.getElementById("hud-voice-backend")!;
+const hudConnectedList = document.getElementById("hud-connected-list")!;
+
+function formatUptime(totalSeconds: number): string {
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+interface SettingsStatus {
+  claude_code_installed: boolean;
+  calendar_accessible: boolean;
+  mail_accessible: boolean;
+  notes_accessible: boolean;
+  vault_accessible: boolean;
+  uptime_seconds: number;
+  tts_backend: string;
+}
+
+const TTS_BACKEND_LABELS: Record<string, string> = {
+  fish: "Fish Audio",
+  macos: "macOS",
+  none: "Assente",
+};
+
+/**
+ * Fetched once, not polled. Reachability probes here shell out to
+ * AppleScript per integration — fine for one page load, not for a 5s loop.
+ * Uptime keeps counting between fetches via the client's own clock, seeded
+ * from the one real reading the server gave us.
+ */
+async function loadConnectedStatus() {
+  let status: SettingsStatus;
+  try {
+    const res = await fetch("/api/settings/status", { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return;
+    status = (await res.json()) as SettingsStatus;
+  } catch {
+    return; // Server not ready yet, or a probe genuinely hung — try again never; a stale "—" is honest here.
+  }
+
+  hudVoiceBackendEl.textContent = TTS_BACKEND_LABELS[status.tts_backend] ?? status.tts_backend;
+
+  const fetchedAt = Date.now();
+  const baseUptime = status.uptime_seconds;
+  hudUptimeEl.textContent = formatUptime(baseUptime);
+  setInterval(() => {
+    hudUptimeEl.textContent = formatUptime(baseUptime + (Date.now() - fetchedAt) / 1000);
+  }, 1000);
+
+  const items: Array<[string, boolean]> = [
+    ["Calendario", status.calendar_accessible],
+    ["Posta", status.mail_accessible],
+    ["Note", status.notes_accessible],
+    ["Vault", status.vault_accessible],
+    ["Browser", true], // Playwright ships with the app; nothing to configure
+    ["Claude Code", status.claude_code_installed],
+  ];
+  hudConnectedList.innerHTML = "";
+  for (const [label, on] of items) {
+    const row = document.createElement("div");
+    row.className = "hud-connected-item" + (on ? "" : " off");
+    row.innerHTML = `<span class="hud-connected-dot"></span><span>${label}</span>`;
+    hudConnectedList.appendChild(row);
+  }
+}
+
+loadConnectedStatus();
 
 // ---------------------------------------------------------------------------
 // Kick off

@@ -6,6 +6,7 @@ what just finished, and what the user is likely referring to.
 """
 
 import logging
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -13,6 +14,30 @@ from pathlib import Path
 log = logging.getLogger("jarvis.dispatch")
 
 DB_PATH = Path(__file__).parent / "data" / "jarvis.db"
+
+# Below this fraction of shared words, two prompts count as different
+# questions rather than a re-ask. Deliberately generous — "where are we at"
+# vs. "how's it going" share almost no words and are still the same status
+# check, so this only needs to catch prompts that are actually asking for
+# something new, not paraphrases of the same ask.
+_PROMPT_MATCH_THRESHOLD = 0.5
+
+_WORD_RE = re.compile(r"[a-zà-ÿ0-9]+", re.IGNORECASE)
+
+
+def _prompts_match(a: str, b: str) -> bool:
+    """Whether two prompts are close enough to count as the same question.
+
+    Word-overlap (Jaccard), not equality — a re-ask is rarely worded
+    identically ("dove siamo?" then "a che punto siamo?"), but genuinely new
+    work reads as a near-disjoint set of words from whatever came before it.
+    """
+    words_a = set(_WORD_RE.findall((a or "").lower()))
+    words_b = set(_WORD_RE.findall((b or "").lower()))
+    if not words_a or not words_b:
+        return False
+    overlap = len(words_a & words_b) / len(words_a | words_b)
+    return overlap >= _PROMPT_MATCH_THRESHOLD
 
 
 def _get_db() -> sqlite3.Connection:
@@ -114,8 +139,19 @@ class DispatchRegistry:
         conn.close()
         return dict(row) if row else None
 
-    def get_recent_for_project(self, project_name: str, max_age_seconds: int = 300) -> dict | None:
-        """Return the most recent completed dispatch for a project if within max_age."""
+    def get_recent_for_project(self, project_name: str, prompt: str, max_age_seconds: int = 300) -> dict | None:
+        """Return the most recent completed dispatch for a project, but only
+        if `prompt` is close to the one that produced it.
+
+        Used to skip re-dispatching when the user re-asks the same question
+        ("where are we at?" twice in a row) — not to answer a *different*
+        question with a stale one. Without the prompt check this matched on
+        project + recency alone: "what's the status" and "now commit and
+        integrate it" landed on the same project within the window and the
+        second got served the first's answer, silently, for as long as the
+        five-minute cache stayed warm. The caller never dispatched, and
+        nobody could tell from the reply that nothing had run.
+        """
         conn = _get_db()
         cutoff = time.time() - max_age_seconds
         row = conn.execute(
@@ -125,7 +161,9 @@ class DispatchRegistry:
             (f"%{project_name}%", cutoff)
         ).fetchone()
         conn.close()
-        return dict(row) if row else None
+        if not row or not _prompts_match(prompt, row["original_prompt"]):
+            return None
+        return dict(row)
 
     def get_recent(self, limit: int = 5) -> list[dict]:
         """Get last N dispatches."""

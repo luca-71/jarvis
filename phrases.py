@@ -100,6 +100,30 @@ CATALOGUE: dict[str, str] = {
     "battery.very_low": "{honorific}, the battery is very low. Worth finding a charger.",
     "battery.critical": "{honorific}, the battery is critical. Plug in now.",
 
+    # Weather conditions — WMO codes collapsed to one label each for the HUD
+    # tile. No {placeholders}: these stand alone, not stitched into a sentence.
+    "weather.clear": "Clear",
+    "weather.mostly_clear": "Mostly clear",
+    "weather.partly_cloudy": "Partly cloudy",
+    "weather.overcast": "Overcast",
+    "weather.fog": "Fog",
+    "weather.drizzle": "Drizzle",
+    "weather.freezing_drizzle": "Freezing drizzle",
+    "weather.rain": "Rain",
+    "weather.heavy_rain": "Heavy rain",
+    "weather.freezing_rain": "Freezing rain",
+    "weather.snow": "Snow",
+    "weather.heavy_snow": "Heavy snow",
+    "weather.snow_grains": "Snow grains",
+    "weather.rain_showers": "Rain showers",
+    "weather.violent_showers": "Violent showers",
+    "weather.snow_showers": "Snow showers",
+    "weather.thunderstorm": "Thunderstorm",
+    "weather.unknown": "—",
+
+    # HUD control panel — quick actions that skip the LLM
+    "hud.new_conversation": "New conversation started.",
+
     # Failures
     "error.generic": "Something went wrong, {honorific}.",
 }

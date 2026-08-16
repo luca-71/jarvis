@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="it">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -34,6 +34,83 @@
 
     <div id="jarvis-caption"></div>
     <div id="status-text"></div>
+
+    <!-- HUD — top left: live system + weather tiles, populated by main.ts -->
+    <div id="hud-top-left">
+      <div id="hud-system" class="hud-panel">
+        <div class="hud-panel-title">SISTEMA</div>
+        <div class="hud-gauge" data-gauge="cpu">
+          <span class="hud-gauge-label">CPU</span>
+          <div class="hud-gauge-track"><div class="hud-gauge-fill"></div></div>
+          <span class="hud-gauge-value">—</span>
+        </div>
+        <div class="hud-gauge" data-gauge="memory">
+          <span class="hud-gauge-label">Memoria</span>
+          <div class="hud-gauge-track"><div class="hud-gauge-fill"></div></div>
+          <span class="hud-gauge-value">—</span>
+        </div>
+        <div class="hud-gauge" data-gauge="tokens">
+          <span class="hud-gauge-label">Token</span>
+          <div class="hud-gauge-track"><div class="hud-gauge-fill"></div></div>
+          <span class="hud-gauge-value">—</span>
+        </div>
+      </div>
+      <div id="hud-weather" class="hud-panel" style="display:none">
+        <div class="hud-panel-title">METEO</div>
+        <div id="hud-weather-body"></div>
+      </div>
+      <div id="hud-status" class="hud-panel">
+        <div class="hud-panel-title">STATO</div>
+        <div class="hud-status-row"><span>Tempo attivo</span><span id="hud-uptime">—</span></div>
+        <div class="hud-status-row"><span>Voce</span><span id="hud-voice-backend">—</span></div>
+        <div id="hud-connected-list" class="hud-connected-list"></div>
+      </div>
+    </div>
+
+    <!-- HUD — bottom left: quick actions (Voice/Vision/Terminal) -->
+    <div id="hud-bottom-left">
+      <div id="hud-actions" class="hud-panel">
+        <button class="hud-action" data-action="voice" title="Muto/Voce">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+          </svg>
+          <span>Voce</span>
+        </button>
+        <button class="hud-action" data-action="vision" title="Guarda lo schermo ora">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+          <span>Visione</span>
+        </button>
+        <button class="hud-action" data-action="terminal" title="Apri un terminale Claude Code">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <polyline points="4 17 10 11 4 5"/>
+            <line x1="12" y1="19" x2="20" y2="19"/>
+          </svg>
+          <span>Terminale</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- HUD — bottom right: command shortcuts + activity feed -->
+    <div id="hud-bottom-right">
+      <div id="hud-commands" class="hud-panel">
+        <div class="hud-panel-title">COMANDI</div>
+        <div class="hud-command-grid">
+          <button class="hud-command" data-command="new_conversation">Nuova chat</button>
+          <button class="hud-command" data-command="dispatch_status">Stato lavori</button>
+          <button class="hud-command" data-command="calendar">Calendario</button>
+          <button class="hud-command" data-command="mail">Posta</button>
+        </div>
+      </div>
+      <div id="hud-activity" class="hud-panel">
+        <div class="hud-panel-title">ATTIVITÀ</div>
+        <div id="hud-activity-list"></div>
+      </div>
+    </div>
 
     <!-- Type instead of speaking. Hidden until summoned with ⌘K or by typing. -->
     <div id="text-bar">
