@@ -12,6 +12,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Optional
 
+from proc import run_capture, env_without
+
 log = logging.getLogger("jarvis.qa")
 
 MAX_RETRIES = 3
@@ -51,17 +53,14 @@ class QAAgent:
             cmd = ["claude", "-p", "--output-format", "text"]
             if _SKIP_PERMISSIONS:
                 cmd.append("--dangerously-skip-permissions")
-            process = await asyncio.create_subprocess_exec(
+            _, stdout, stderr = await run_capture(
                 *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                input=qa_prompt.encode(),
                 cwd=working_dir,
-            )
-
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=qa_prompt.encode()),
                 timeout=120.0,
+                # A set ANTHROPIC_API_KEY disables claude.ai connectors for
+                # claude -p — see work_mode.py's WorkSession.send().
+                env=env_without("ANTHROPIC_API_KEY"),
             )
 
             raw = stdout.decode().strip()
@@ -140,20 +139,15 @@ class QAAgent:
             cmd = ["claude", "-p", "--output-format", "text"]
             if _SKIP_PERMISSIONS:
                 cmd.append("--dangerously-skip-permissions")
-            process = await asyncio.create_subprocess_exec(
+            returncode, stdout, stderr = await run_capture(
                 *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                input=retry_prompt.encode(),
                 cwd=working_dir,
-            )
-
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=retry_prompt.encode()),
                 timeout=300.0,
+                env=env_without("ANTHROPIC_API_KEY"),
             )
 
-            if process.returncode == 0:
+            if returncode == 0:
                 result = stdout.decode().strip()
                 return {
                     "status": "completed",

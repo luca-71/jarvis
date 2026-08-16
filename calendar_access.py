@@ -9,6 +9,7 @@ import asyncio
 import logging
 
 from phrases import phrase
+from proc import run_capture
 import os
 import time as _time
 from datetime import datetime, timedelta
@@ -52,12 +53,7 @@ async def _ensure_calendar_running():
     if _calendar_launched:
         return
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "open", "-a", "Calendar", "-g",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=5)
+        await run_capture("open", "-a", "Calendar", "-g", timeout=5)
         await asyncio.sleep(2)
         _calendar_launched = True
         log.info("Calendar.app launched")
@@ -69,13 +65,10 @@ async def _fetch_calendar_events(cal_name: str, timeout: float = 12.0) -> list[d
     """Fetch all events from one calendar, filter to today in Python."""
     script = _BULK_SCRIPT.replace("{cal_name}", cal_name)
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, _ = await run_capture(
+            "osascript", "-e", script, timeout=timeout
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        if proc.returncode != 0:
+        if returncode != 0:
             return []
 
         raw = stdout.decode().strip()
@@ -113,10 +106,6 @@ async def _fetch_calendar_events(cal_name: str, timeout: float = 12.0) -> list[d
         return events
 
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
         log.debug(f"Calendar {cal_name} timed out")
         return []
     except Exception as e:
@@ -212,14 +201,12 @@ async def get_calendar_names() -> list[str]:
     """Get list of all calendar names."""
     await _ensure_calendar_running()
     try:
-        proc = await asyncio.create_subprocess_exec(
+        returncode, stdout, _ = await run_capture(
             "osascript", "-e",
             'tell application "Calendar" to return name of every calendar',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            timeout=5,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0:
+        if returncode == 0:
             return [c.strip() for c in stdout.decode().strip().split(",") if c.strip()]
     except Exception:
         pass

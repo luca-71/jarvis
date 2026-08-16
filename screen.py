@@ -13,6 +13,8 @@ import logging
 import tempfile
 from pathlib import Path
 
+from proc import run_capture
+
 log = logging.getLogger("jarvis.screen")
 
 
@@ -48,14 +50,11 @@ end tell
 return windowList
 """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, stderr = await run_capture(
+            "osascript", "-e", script, timeout=5
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
 
-        if proc.returncode != 0:
+        if returncode != 0:
             log.warning(f"get_active_windows failed: {stderr.decode()[:200]}")
             return []
 
@@ -91,13 +90,10 @@ tell application "System Events"
 end tell
 """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, _ = await run_capture(
+            "osascript", "-e", script, timeout=5
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0:
+        if returncode == 0:
             return [a.strip() for a in stdout.decode().strip().split("\n") if a.strip()]
         return []
     except Exception as e:
@@ -123,14 +119,9 @@ async def take_screenshot(display_only: bool = True) -> str | None:
             cmd.append("-m")  # main display only
         cmd.append(tmp_path)
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=10)
+        returncode, _, _ = await run_capture(*cmd, timeout=10)
 
-        if proc.returncode != 0 or not Path(tmp_path).exists():
+        if returncode != 0 or not Path(tmp_path).exists():
             log.warning("Screenshot capture failed")
             return None
 

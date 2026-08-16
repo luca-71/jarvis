@@ -17,6 +17,7 @@ from typing import Optional
 
 import anthropic
 
+from proc import run_capture
 from templates import TEMPLATES, get_template
 
 log = logging.getLogger("jarvis.planner")
@@ -363,16 +364,11 @@ async def gather_project_context(project_path: str) -> dict:
                 pass
 
     # Git log
-    import asyncio
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "log", "--oneline", "-5",
-            cwd=project_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, _ = await run_capture(
+            "git", "log", "--oneline", "-5", cwd=project_path, timeout=10
         )
-        stdout, _ = await proc.communicate()
-        if proc.returncode == 0:
+        if returncode == 0:
             context["git_log"] = stdout.decode().strip()
     except Exception:
         pass

@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+from proc import run_capture
+
 log = logging.getLogger("jarvis.actions")
 
 DESKTOP_PATH = Path.home() / "Desktop"
@@ -32,12 +34,7 @@ async def _mark_terminal_as_jarvis(revert_after: float = 5.0):
         'end tell'
     )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script_save,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
+        _, stdout, _ = await run_capture("osascript", "-e", script_save)
         original_profile = stdout.decode().strip()
 
         # Switch to Ocean
@@ -46,12 +43,7 @@ async def _mark_terminal_as_jarvis(revert_after: float = 5.0):
             '    set current settings of front window to settings set "Ocean"\n'
             'end tell'
         )
-        proc2 = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script_set,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc2.communicate()
+        await run_capture("osascript", "-e", script_set)
 
         # Schedule revert
         if original_profile and original_profile != "Ocean":
@@ -72,12 +64,7 @@ async def _revert_terminal_theme(profile_name: str):
         'end tell'
     )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
+        await run_capture("osascript", "-e", script)
     except Exception:
         pass
 
@@ -103,13 +90,13 @@ async def open_terminal(command: str = "") -> dict:
             "    activate\n"
             "end tell"
         )
-    proc = await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    success = proc.returncode == 0
+    try:
+        returncode, _, stderr = await run_capture("osascript", "-e", script)
+    except asyncio.TimeoutError:
+        log.error("open_terminal timed out")
+        return {"success": False, "confirmation": "Terminal isn't answering, sir."}
+
+    success = returncode == 0
     if not success:
         log.error(f"open_terminal failed: {stderr.decode()}")
     else:
@@ -141,13 +128,13 @@ async def open_browser(url: str, browser: str = "chrome") -> dict:
             "end tell"
         )
 
-    proc = await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    success = proc.returncode == 0
+    try:
+        returncode, _, stderr = await run_capture("osascript", "-e", script)
+    except asyncio.TimeoutError:
+        log.error(f"open_browser ({app_name}) timed out")
+        return {"success": False, "confirmation": f"{app_name} isn't answering, sir."}
+
+    success = returncode == 0
     if not success:
         log.error(f"open_browser ({app_name}) failed: {stderr.decode()}")
     return {
@@ -179,13 +166,13 @@ async def open_claude_in_project(project_dir: str, prompt: str) -> dict:
         f'    do script "cd {escaped_dir} && claude{skip_flag}"\n'
         "end tell"
     )
-    proc = await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    success = proc.returncode == 0
+    try:
+        returncode, _, stderr = await run_capture("osascript", "-e", script)
+    except asyncio.TimeoutError:
+        log.error("open_claude_in_project timed out")
+        return {"success": False, "confirmation": "Terminal isn't answering, sir."}
+
+    success = returncode == 0
     if not success:
         log.error(f"open_claude_in_project failed: {stderr.decode()}")
     else:
@@ -248,12 +235,9 @@ return "OK"
 '''
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, stderr = await run_capture(
+            "osascript", "-e", script, timeout=15
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
 
         result = stdout.decode().strip()
         if result == "NOT_FOUND":
@@ -262,7 +246,7 @@ return "OK"
                 "confirmation": f"Couldn't find a terminal for {project_name}, sir.",
             }
 
-        success = proc.returncode == 0
+        success = returncode == 0
         if not success:
             log.error(f"prompt_existing_terminal failed: {stderr.decode()[:200]}")
 
@@ -292,13 +276,8 @@ async def get_chrome_tab_info() -> dict:
         "end tell"
     )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode == 0:
+        returncode, stdout, _ = await run_capture("osascript", "-e", script)
+        if returncode == 0:
             result = stdout.decode().strip()
             parts = result.split("|", 1)
             if len(parts) == 2:

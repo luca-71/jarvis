@@ -12,6 +12,7 @@ import asyncio
 import logging
 
 from phrases import phrase
+from proc import run_capture
 from datetime import datetime
 
 log = logging.getLogger("jarvis.mail")
@@ -27,12 +28,7 @@ async def _ensure_mail_running():
 
     check = 'tell application "System Events" to return (name of every application process) contains "Mail"'
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", check,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+        _, stdout, _ = await run_capture("osascript", "-e", check, timeout=3)
         if "true" in stdout.decode().lower():
             _mail_launched = True
             return
@@ -40,12 +36,7 @@ async def _ensure_mail_running():
         pass
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "open", "-a", "Mail", "-g",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=5)
+        await run_capture("open", "-a", "Mail", "-g", timeout=5)
         await asyncio.sleep(2)
         _mail_launched = True
         log.info("Mail.app launched")
@@ -57,14 +48,11 @@ async def _run_mail_script(script: str, timeout: float = 20) -> str:
     """Run an AppleScript against Mail.app and return output."""
     await _ensure_mail_running()
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        returncode, stdout, stderr = await run_capture(
+            "osascript", "-e", script, timeout=timeout
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
 
-        if proc.returncode != 0:
+        if returncode != 0:
             err = stderr.decode().strip()[:200]
             log.warning(f"Mail script failed: {err}")
             return ""

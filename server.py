@@ -53,6 +53,7 @@ from memory import (
 from notes_access import get_recent_notes, get_note_folders, read_note, search_notes_apple, create_apple_note
 from obsidian_access import search_vault, read_vault_note, vault_stats, format_search_for_voice
 from phrases import phrase, ensure_language
+from proc import run_capture, run_detached, env_without
 from tts import list_voices, resolve_voice, speak as macos_speak
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
@@ -640,13 +641,9 @@ class ClaudeTaskManager:
         end tell
         '''
 
-        process = await asyncio.create_subprocess_exec(
-            "osascript", "-e", applescript,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await process.communicate()
-        task.pid = process.pid
+        # osascript only asks Terminal to open the window and returns; the
+        # claude run it starts is tracked through the output file below.
+        await run_detached("osascript", "-e", applescript)
 
         # Monitor the output file for completion
         output_file = Path(work_dir) / ".jarvis_output.txt"
@@ -769,6 +766,7 @@ class ClaudeTaskManager:
                     await asyncio.wait_for(process.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
                     process.kill()
+                    await process.wait()  # reap it, or the slot stays taken
             except ProcessLookupError:
                 pass
 
@@ -1042,17 +1040,15 @@ async def _execute_research(target: str, ws=None):
         cmd = ["claude", "-p", "--output-format", "text"]
         if _SKIP_PERMISSIONS:
             cmd.append("--dangerously-skip-permissions")
-        process = await asyncio.create_subprocess_exec(
+        _, stdout, stderr = await run_capture(
             *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            input=prompt.encode(),
             cwd=path,
-        )
-
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(input=prompt.encode()),
             timeout=300,
+            # See work_mode.py's WorkSession.send() — a set ANTHROPIC_API_KEY
+            # disables claude.ai connectors for claude -p, same as any other
+            # dispatch.
+            env=env_without("ANTHROPIC_API_KEY"),
         )
 
         result = stdout.decode().strip()
@@ -1119,12 +1115,7 @@ tell application "Terminal"
 end tell
 '''
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=5)
+        await run_capture("osascript", "-e", script, timeout=5)
     except Exception:
         pass
 
@@ -1163,6 +1154,7 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             dispatch_id = dispatch_registry.register(project_name, project_dir or "", prompt)
 
         if not project_dir:
+            dispatch_registry.update_status(dispatch_id, "failed", response="", summary=f"No directory found for '{project_name}'.")
             msg = phrase("build.no_directory", project=project_name)
             audio = await synthesize_speech(msg)
             if ws:
@@ -2110,11 +2102,7 @@ async def handle_build(target: str) -> str:
         f'    do script "cd {escaped_path} && cat .jarvis_prompt.txt | claude -p{skip_flag}"\n'
         "end tell"
     )
-    await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    await run_detached("osascript", "-e", script)
 
     recently_built.append({"name": name, "path": path, "time": time.time()})
     return f"On it, sir. Claude Code is working in {name}."
@@ -2142,7 +2130,7 @@ async def handle_show_recent() -> str:
     # Fall back to opening the folder in Finder
     escaped_last_path = applescript_escape(last["path"])
     script = f'tell application "Finder"\nactivate\nopen POSIX file "{escaped_last_path}"\nend tell'
-    await asyncio.create_subprocess_exec("osascript", "-e", script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    await run_detached("osascript", "-e", script)
     return f"Opened the {last['name']} folder in Finder, sir."
 
 
@@ -3299,11 +3287,7 @@ async def api_fix_self():
         f'    do script "cd {escaped_jarvis_dir} && claude{skip_flag}"\n'
         'end tell'
     )
-    await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    await run_detached("osascript", "-e", script)
     log.info("Work mode: JARVIS repo opened for self-improvement")
     return {"status": "work_mode_active", "path": jarvis_dir}
 

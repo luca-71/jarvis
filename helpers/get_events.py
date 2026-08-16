@@ -61,6 +61,7 @@ async def fetch_calendar(cal_name: str, timeout: float = 5.0) -> str:
     except asyncio.TimeoutError:
         try:
             proc.kill()
+            await proc.wait()  # without the wait it lingers as a zombie
         except Exception:
             pass
         return ""
@@ -69,7 +70,12 @@ async def fetch_calendar(cal_name: str, timeout: float = 5.0) -> str:
 
 
 async def discover_calendars() -> list[str]:
-    """Auto-discover all calendar names from Apple Calendar."""
+    """Auto-discover all calendar names from Apple Calendar.
+
+    This helper runs as its own script, so it cannot import the shared
+    run_capture from the project root — the kill is spelled out instead.
+    """
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "osascript", "-e",
@@ -81,7 +87,12 @@ async def discover_calendars() -> list[str]:
         if proc.returncode == 0:
             return [c.strip() for c in stdout.decode().strip().split(",") if c.strip()]
     except Exception:
-        pass
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
     return []
 
 

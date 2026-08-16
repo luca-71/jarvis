@@ -15,6 +15,8 @@ import re
 import tempfile
 from pathlib import Path
 
+from proc import run_capture
+
 log = logging.getLogger("jarvis.tts")
 
 # AAC in an MP4 container. The `say` default is AIFF-C, which Chrome does not
@@ -68,12 +70,7 @@ async def list_voices(refresh: bool = False) -> list[dict]:
     if _voice_cache is not None and not refresh:
         return _voice_cache
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "say", "-v", "?",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        _, stdout, _ = await run_capture("say", "-v", "?", timeout=10)
     except Exception as e:
         log.warning(f"Could not list voices: {e}")
         return []
@@ -133,13 +130,8 @@ async def speak(text: str, voice: str | None = None, timeout: float = 30) -> byt
         args += ["--", clean]
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            if proc.returncode != 0:
+            returncode, _, stderr = await run_capture(*args, timeout=timeout)
+            if returncode != 0:
                 log.warning(f"say failed: {stderr.decode(errors='replace')[:200]}")
                 return None
             if not out.exists():

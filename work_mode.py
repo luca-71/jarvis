@@ -16,6 +16,8 @@ import os
 import shutil
 from pathlib import Path
 
+from proc import run_capture, env_without
+
 log = logging.getLogger("jarvis.work_mode")
 
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
@@ -79,24 +81,25 @@ class WorkSession:
         self._status = "working"
 
         try:
-            process = await asyncio.create_subprocess_exec(
+            returncode, stdout, stderr = await run_capture(
                 *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                input=user_text.encode(),
                 cwd=self._working_dir,
-            )
-
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=user_text.encode()),
                 timeout=300,
+                # JARVIS loads ANTHROPIC_API_KEY into its own environment to
+                # talk to the Claude API directly, and claude -p treats a set
+                # ANTHROPIC_API_KEY as taking precedence over the user's
+                # claude.ai login — silently disabling claude.ai connectors
+                # on every dispatch. Strip it so a dispatched session
+                # authenticates the same way an interactive terminal one would.
+                env=env_without("ANTHROPIC_API_KEY"),
             )
 
             response = stdout.decode().strip()
             self._message_count += 1
             self._status = "done"
 
-            if process.returncode != 0:
+            if returncode != 0:
                 error = stderr.decode().strip()[:200]
                 log.error(f"claude -p error: {error}")
                 self._status = "error"
