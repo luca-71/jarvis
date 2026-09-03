@@ -32,6 +32,16 @@
       <button id="btn-fix-self">Fix Yourself</button>
     </div>
 
+    <!-- Confirmation banner — issued by confirm.py, never by the model.
+         Hidden until a POST like /api/restart comes back "pending". -->
+    <div id="confirm-banner" style="display:none">
+      <div id="confirm-detail"></div>
+      <div id="confirm-buttons">
+        <button id="btn-confirm-yes">CONFERMA</button>
+        <button id="btn-confirm-no">ANNULLA</button>
+      </div>
+    </div>
+
     <div id="jarvis-caption"></div>
     <div id="status-text"></div>
 

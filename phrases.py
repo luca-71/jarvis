@@ -86,6 +86,10 @@ CATALOGUE: dict[str, str] = {
     "vault.says": "Your note '{title}' says: {snippet}",
     "vault.also": "There's also {titles}.",
 
+    # Undo
+    "undo.done": "Done, {honorific}. I've undone: {label}.",
+    "undo.nothing": "There's nothing to undo, {honorific}.",
+
     # Timers — spoken when one comes due, with no LLM in the loop to phrase it.
     # Deliberately free of durations and counts: rendering "10 minutes" needs
     # per-language plural rules the translator cannot express in a template.

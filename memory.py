@@ -317,6 +317,19 @@ def complete_task(task_id: int):
     conn.close()
 
 
+def delete_task(task_id: int) -> bool:
+    """Delete a task outright, for undo.py. Returns whether it existed."""
+    conn = _get_db()
+    row = conn.execute("SELECT title FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row:
+        conn.execute("DELETE FROM task_fts WHERE rowid = ?", (task_id,))
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        log.info(f"Deleted task #{task_id}: {row['title']}")
+    conn.close()
+    return bool(row)
+
+
 def search_tasks(query: str, limit: int = 10) -> list[dict]:
     """Search tasks by text."""
     fts_query = _sanitize_fts_query(query)
@@ -357,6 +370,19 @@ def create_note(content: str, title: str = "", topic: str = "", tags: list[str] 
     conn.close()
     log.info(f"Created note: {title or content[:40]}")
     return note_id
+
+
+def delete_note(note_id: int) -> bool:
+    """Delete a note outright, for undo.py. Returns whether it existed."""
+    conn = _get_db()
+    row = conn.execute("SELECT title, content FROM notes WHERE id = ?", (note_id,)).fetchone()
+    if row:
+        conn.execute("DELETE FROM note_fts WHERE rowid = ?", (note_id,))
+        conn.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+        conn.commit()
+        log.info(f"Deleted note #{note_id}: {row['title'] or row['content'][:40]}")
+    conn.close()
+    return bool(row)
 
 
 def search_notes(query: str, limit: int = 10) -> list[dict]:

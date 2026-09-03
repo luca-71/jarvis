@@ -50,7 +50,10 @@ from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
     format_tasks_for_voice, extract_memories, get_important_memories,
+    forget, delete_task, delete_note,
 )
+import undo
+import confirm
 from notes_access import get_recent_notes, get_note_folders, read_note, search_notes_apple, create_apple_note
 from obsidian_access import search_vault, read_vault_note, vault_stats, format_search_for_voice
 from phrases import phrase, ensure_language
@@ -315,6 +318,9 @@ CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're
 CRITICAL: [ACTION:TIMER] STARTS a new countdown. Use it ONLY when the user asks for one to be set. When they ask ABOUT a timer that is already running — "how long left?", "is it still going?", "quanto manca?" — ANSWER from the TIMERS section below and emit NO tag whatsoever. Tagging that question starts a second timer, and the user gets told twice when it comes due.
   "how long left on the pasta?" → "Just under four minutes, sir." — no tag.
   Phrase the remaining time naturally. Never read out raw seconds like "247 seconds".
+- [ACTION:UNDO] — reverse the last thing you added: a task, a note, or a stored memory. Use it whenever the user says "undo", "annulla", or asks you to take back what you just saved. You don't know yet whether there's anything to undo or what it was — say something brief that works either way ("On it, sir." / "Vediamo, signore.") BEFORE the tag; the actual result gets spoken once the undo runs.
+  "annulla" → "Vediamo, signore. [ACTION:UNDO]"
+  This only reverses ADD_TASK, ADD_NOTE and REMEMBER — it cannot undo a build, a message sent, or an Apple Note.
 
 You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
 
@@ -990,7 +996,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CALENDAR|MAIL|VAULT|TIMER|CANCEL_TIMER)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CALENDAR|MAIL|VAULT|TIMER|CANCEL_TIMER|UNDO)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -2345,6 +2351,16 @@ async def _do_vault_lookup(query: str) -> str:
     return format_search_for_voice(hits, query)
 
 
+async def _do_undo_lookup() -> str:
+    """Reverse the last undoable action. What (if anything) gets undone
+    isn't known until it runs, so — like calendar/mail/screen — this reports
+    back rather than being said ahead of time."""
+    label = await undo.undo_last()
+    if label is None:
+        return phrase("undo.nothing")
+    return phrase("undo.done", label=label)
+
+
 async def _do_calendar_lookup() -> str:
     """Slow calendar fetch — runs in thread."""
     await refresh_calendar_cache()
@@ -3006,16 +3022,18 @@ async def voice_handler(ws: WebSocket):
                                         title = parts[1].strip()
                                         desc = parts[2].strip() if len(parts) > 2 else ""
                                         due = parts[3].strip() if len(parts) > 3 else ""
-                                        create_task(title=title, description=desc, priority=priority, due_date=due)
+                                        new_task_id = create_task(title=title, description=desc, priority=priority, due_date=due)
+                                        undo.register(f"Task added: {title}", lambda tid=new_task_id: delete_task(tid))
                                         log.info(f"Task created: {title}")
                                         await _notify_activity(f"Task added: {title}")
                                 elif embedded_action["action"] == "add_note":
                                     target = embedded_action["target"]
                                     if "|||" in target:
                                         topic, _, content = target.partition("|||")
-                                        create_note(content=content.strip(), topic=topic.strip())
+                                        new_note_id = create_note(content=content.strip(), topic=topic.strip())
                                     else:
-                                        create_note(content=target)
+                                        new_note_id = create_note(content=target)
+                                    undo.register("Note saved", lambda nid=new_note_id: delete_note(nid))
                                     log.info(f"Note created")
                                     await _notify_activity("Note saved")
                                 elif embedded_action["action"] == "complete_task":
@@ -3027,8 +3045,10 @@ async def voice_handler(ws: WebSocket):
                                     except ValueError:
                                         pass
                                 elif embedded_action["action"] == "remember":
-                                    remember(embedded_action["target"].strip(), mem_type="fact", importance=7)
-                                    log.info(f"Memory stored: {embedded_action['target'][:60]}")
+                                    fact = embedded_action["target"].strip()
+                                    new_mem_id = remember(fact, mem_type="fact", importance=7)
+                                    undo.register(f"Memory stored: {fact[:60]}", lambda mid=new_mem_id: forget(mid))
+                                    log.info(f"Memory stored: {fact[:60]}")
                                     await _notify_activity("Memory stored")
                                 elif embedded_action["action"] == "timer":
                                     target = embedded_action["target"]
@@ -3075,6 +3095,8 @@ async def voice_handler(ws: WebSocket):
                                         "vault", lambda: _do_vault_lookup(_query), ws,
                                         history=history, voice_state=voice_state,
                                     ))
+                                elif embedded_action["action"] == "undo":
+                                    asyncio.create_task(_lookup_and_report("undo", _do_undo_lookup, ws, history=history, voice_state=voice_state))
                                 elif embedded_action["action"] == "read_note":
                                     # Read note in background and report back
                                     async def _read_and_report(search_term, _ws):
@@ -3380,16 +3402,45 @@ async def api_save_preferences(body: PreferencesUpdate):
 # Control endpoints (restart, fix-self)
 # ---------------------------------------------------------------------------
 
+class ConfirmResolve(BaseModel):
+    key: str
+    confirmed: bool
+
+
 @app.post("/api/restart")
 async def api_restart():
-    """Restart the JARVIS server."""
-    log.info("Restart requested — shutting down in 2 seconds")
-    async def _restart():
-        await asyncio.sleep(2)
-        cmd = [sys.executable, __file__, "--port", "8340", "--host", "0.0.0.0"]
-        os.execv(sys.executable, cmd)
-    asyncio.create_task(_restart())
-    return {"status": "restarting"}
+    """Ask the interface to confirm before restarting the JARVIS server.
+
+    The restart itself doesn't run here — see confirm.py. Nothing stops the
+    model from claiming a restart is confirmed; only a person clicking
+    CONFIRM in the UI can call /api/confirm and actually trigger it.
+    """
+    async def _do_restart() -> str:
+        async def _exec():
+            await asyncio.sleep(2)
+            # Replay the flags this process actually started with, not a
+            # hardcoded 8340/0.0.0.0 — otherwise a server launched on any
+            # other port restarts itself into a bind conflict instead.
+            cmd = [sys.executable, __file__, *sys.argv[1:]]
+            os.execv(sys.executable, cmd)
+        asyncio.create_task(_exec())
+        return "restarting"
+
+    banner = await confirm.request(
+        key="restart",
+        detail="Restart the JARVIS server?",
+        run=_do_restart,
+    )
+    return {"status": "pending", **banner}
+
+
+@app.post("/api/confirm")
+async def api_confirm(body: ConfirmResolve):
+    """Resolve a pending confirmation banner — see confirm.py."""
+    result = await confirm.resolve(body.key, body.confirmed)
+    if result is None:
+        return {"status": "cancelled"}
+    return {"status": "confirmed", "result": result}
 
 
 @app.post("/api/fix-self")

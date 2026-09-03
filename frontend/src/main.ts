@@ -698,14 +698,65 @@ document.addEventListener("click", () => {
 btnRestart.addEventListener("click", async (e) => {
   e.stopPropagation();
   menuDropdown.style.display = "none";
-  statusEl.textContent = "restarting...";
   try {
-    await fetch("/api/restart", { method: "POST" });
-    // Wait a few seconds then reload
-    setTimeout(() => window.location.reload(), 4000);
+    const res = await fetch("/api/restart", { method: "POST" });
+    const data = await res.json();
+    if (data.status === "pending") {
+      showConfirmBanner(data.key, data.detail);
+    }
   } catch {
     statusEl.textContent = "restart failed";
   }
+});
+
+// Confirmation banner — CONFIRM/CANCEL here is the only thing that can ever
+// resolve a pending irreversible action (see confirm.py). The model can ask
+// for one but never approve it itself.
+const confirmBanner = document.getElementById("confirm-banner")!;
+const confirmDetail = document.getElementById("confirm-detail")!;
+const btnConfirmYes = document.getElementById("btn-confirm-yes")!;
+const btnConfirmNo = document.getElementById("btn-confirm-no")!;
+let pendingConfirmKey: string | null = null;
+
+function showConfirmBanner(key: string, detail: string) {
+  pendingConfirmKey = key;
+  confirmDetail.textContent = detail;
+  confirmBanner.style.display = "flex";
+}
+
+function hideConfirmBanner() {
+  pendingConfirmKey = null;
+  confirmBanner.style.display = "none";
+}
+
+async function resolveConfirm(confirmed: boolean) {
+  if (!pendingConfirmKey) return;
+  const key = pendingConfirmKey;
+  hideConfirmBanner();
+  try {
+    const res = await fetch("/api/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, confirmed }),
+    });
+    const data = await res.json();
+    if (confirmed && data.status === "confirmed") {
+      statusEl.textContent = "restarting...";
+      setTimeout(() => window.location.reload(), 4000);
+    }
+  } catch {
+    statusEl.textContent = "confirm failed";
+  }
+}
+
+btnConfirmYes.addEventListener("click", (e) => {
+  e.stopPropagation();
+  resolveConfirm(true);
+});
+
+btnConfirmNo.addEventListener("click", (e) => {
+  e.stopPropagation();
+  resolveConfirm(false);
 });
 
 btnFixSelf.addEventListener("click", (e) => {

@@ -136,6 +136,69 @@ html, body {
   color: rgba(14, 165, 233, 0.8);
 }
 
+/* Confirmation banner — the token it grants comes from a click here, never
+   from the model. Red accent deliberately breaks from the cyan HUD chrome
+   so it reads as "this one is different" at a glance. */
+#confirm-banner {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  background: rgba(10, 10, 15, 0.95);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 10px;
+  padding: 12px 16px;
+  backdrop-filter: blur(12px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+#confirm-detail {
+  color: rgba(239, 68, 68, 0.85);
+  font-size: 13px;
+  letter-spacing: 0.3px;
+}
+
+#confirm-buttons {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+#confirm-buttons button {
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+#btn-confirm-yes {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  color: rgba(239, 68, 68, 0.95);
+}
+
+#btn-confirm-yes:hover {
+  background: rgba(239, 68, 68, 0.3);
+}
+
+#btn-confirm-no {
+  background: none;
+  border: 1px solid rgba(14, 165, 233, 0.25);
+  color: rgba(14, 165, 233, 0.6);
+}
+
+#btn-confirm-no:hover {
+  background: rgba(14, 165, 233, 0.1);
+  color: rgba(14, 165, 233, 0.85);
+}
+
 #error-text {
   position: fixed;
   top: 40px;
