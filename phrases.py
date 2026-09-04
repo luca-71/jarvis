@@ -220,7 +220,9 @@ async def translate(lang: str, language_name: str, client) -> bool:
         "They are spoken aloud by JARVIS, a British butler AI: dry, economical, "
         "never chatty. Match that register in the target language.\n\n"
         "Rules:\n"
-        "- Return ONLY a JSON object with exactly the same keys.\n"
+        "- Return ONLY a JSON object with exactly the same keys. No explanation, "
+        "no reasoning, no commentary before or after it — your entire reply is "
+        "the JSON object itself. Begin your reply with the { character.\n"
         "- Keep every {placeholder} verbatim, including the braces. Reorder them "
         "freely to suit the language, but never rename, drop or add one.\n"
         "- {honorific} is the user's chosen form of address. Leave it as the "
@@ -232,7 +234,13 @@ async def translate(lang: str, language_name: str, client) -> bool:
     try:
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=4000,
+            # On the OpenRouter fallback, "reasoning: exclude" (llm.py) drops the
+            # chain-of-thought from the visible text but the tokens still count
+            # against this budget — measured at ~8.4K output tokens to translate
+            # 69 keys, nearly all of it hidden reasoning the model can't be talked
+            # out of. 4000 cut it off before a single closing brace; this leaves
+            # headroom as the catalogue grows.
+            max_tokens=12000,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
