@@ -75,6 +75,30 @@
         <div class="hud-status-row"><span>Voce</span><span id="hud-voice-backend">—</span></div>
         <div id="hud-connected-list" class="hud-connected-list"></div>
       </div>
+      <div id="hud-memory" class="hud-panel">
+        <div class="hud-panel-title">MEMORIA</div>
+        <div class="hud-memory-body">
+          <svg id="hud-brain" class="hud-brain" viewBox="0 0 100 90" width="44" height="40" aria-hidden="true">
+            <path class="hud-brain-outline" d="M50,10 C35,10 25,20 25,30 C15,30 10,40 15,48 C10,55 15,65 25,65 C25,75 35,80 50,80 C65,80 75,75 75,65 C85,65 90,55 85,48 C90,40 85,30 75,30 C75,20 65,10 50,10 Z" />
+            <path class="hud-brain-seam" d="M50,10 C45,25 55,35 50,50 C45,65 55,75 50,80" />
+            <line class="hud-brain-link" x1="35" y1="35" x2="50" y2="45" />
+            <line class="hud-brain-link" x1="65" y1="35" x2="50" y2="45" />
+            <line class="hud-brain-link" x1="30" y1="55" x2="50" y2="45" />
+            <line class="hud-brain-link" x1="70" y1="55" x2="50" y2="45" />
+            <line class="hud-brain-link" x1="50" y1="45" x2="50" y2="65" />
+            <circle class="hud-brain-node" style="--i:0" cx="35" cy="35" r="3" />
+            <circle class="hud-brain-node" style="--i:1" cx="65" cy="35" r="3" />
+            <circle class="hud-brain-node" style="--i:2" cx="30" cy="55" r="3" />
+            <circle class="hud-brain-node" style="--i:3" cx="70" cy="55" r="3" />
+            <circle class="hud-brain-node" style="--i:4" cx="50" cy="45" r="3" />
+            <circle class="hud-brain-node" style="--i:5" cx="50" cy="65" r="3" />
+          </svg>
+          <div class="hud-memory-stats">
+            <div class="hud-memory-total"><span id="hud-memory-total">—</span><span class="hud-memory-total-label">ricordi</span></div>
+            <div id="hud-memory-sync" class="hud-memory-sync">—</div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- HUD — bottom left: quick actions (Voice/Vision/Terminal) -->
@@ -106,6 +130,18 @@
     </div>
 
     <!-- HUD — bottom right: command shortcuts + activity feed -->
+    <!-- Running transcript. The caption over the orb shows one line and fades;
+         this keeps the exchange so you can read back what was actually said. -->
+    <div id="hud-chat" class="hud-panel">
+      <div class="hud-panel-title">
+        CONVERSAZIONE
+        <span id="ws-dot" class="ws-dot" title="stato del collegamento"></span>
+      </div>
+      <div id="hud-chat-log">
+        <div id="hud-chat-empty">Nessuna conversazione ancora.</div>
+      </div>
+    </div>
+
     <div id="hud-bottom-right">
       <div id="hud-commands" class="hud-panel">
         <div class="hud-panel-title">COMANDI</div>

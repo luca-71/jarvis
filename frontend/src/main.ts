@@ -58,6 +58,62 @@ function showCaption(text: unknown) {
   }, holdMs);
 }
 
+// ---------------------------------------------------------------------------
+// Conversation transcript
+// ---------------------------------------------------------------------------
+
+const chatLog = document.getElementById("hud-chat-log")!;
+const CHAT_MAX_TURNS = 40;
+
+// Polled rather than pushed: the socket's own close event does not fire in
+// every failure mode (a suspended tab, a dropped WiFi), and one comparison a
+// second costs nothing.
+const wsDot = document.getElementById("ws-dot");
+setInterval(() => {
+  wsDot?.classList.toggle("online", socket.isConnected());
+}, 1000);
+
+// The last bubble JARVIS is still filling in. Streamed replies arrive one
+// message per sentence, each carrying the FULL text so far — appending each
+// one would print the reply three times, growing. Instead the same bubble is
+// rewritten while the new text still starts with what is already there.
+let lastJarvisBubble: HTMLElement | null = null;
+let lastJarvisText = "";
+
+function pushChat(role: "user" | "jarvis", text: string) {
+  if (!text || !text.trim()) return;
+  const clean = text.trim();
+
+  if (role === "jarvis" && lastJarvisBubble && clean.startsWith(lastJarvisText)) {
+    lastJarvisBubble.textContent = clean;
+    lastJarvisText = clean;
+    chatLog.scrollTop = chatLog.scrollHeight;
+    return;
+  }
+
+  document.getElementById("hud-chat-empty")?.remove();
+
+  const bubble = document.createElement("div");
+  bubble.className = `chat-turn ${role}`;
+  bubble.textContent = clean;
+  chatLog.appendChild(bubble);
+
+  if (role === "jarvis") {
+    lastJarvisBubble = bubble;
+    lastJarvisText = clean;
+  } else {
+    // A new question closes the previous answer: anything arriving after this
+    // belongs to a different reply, however similar it starts.
+    lastJarvisBubble = null;
+    lastJarvisText = "";
+  }
+
+  while (chatLog.childElementCount > CHAT_MAX_TURNS) {
+    chatLog.firstElementChild?.remove();
+  }
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
 function updateStatus(state: State) {
   const labels: Record<State, string> = {
     idle: "",
@@ -144,7 +200,13 @@ function flushUtterance() {
   pendingFragments = [];
   if (!text) return;
 
-  socket.send({ type: "transcript", text, isFinal: true });
+  if (!socket.send({ type: "transcript", text, isFinal: true })) {
+    pushChat("user", text);
+    showError("Connessione persa — ricarico…");
+    transition("idle");
+    return;
+  }
+  pushChat("user", text);
   transition("thinking");
 }
 
@@ -225,7 +287,12 @@ function sendTypedMessage() {
   if (!text) return;
 
   audioPlayer.stop(); // Cut off any reply still playing, as speaking does.
-  socket.send({ type: "transcript", text, isFinal: true, silent: true });
+  pushChat("user", text);
+  if (!socket.send({ type: "transcript", text, isFinal: true, silent: true })) {
+    showError("Connessione persa — ricarico…");
+    transition("idle");
+    return;
+  }
   transition("thinking");
 
   // The bar stays open: someone who typed once is usually still unable to
@@ -331,6 +398,7 @@ socket.onMessage((msg) => {
     // Log text for debugging
     if (msg.text) console.log("[JARVIS]", msg.text);
     showCaption(msg.text);
+    pushChat("jarvis", msg.text as string);
   } else if (type === "status") {
     const state = msg.state as string;
     if (state === "thinking" && currentState !== "thinking") {
@@ -346,6 +414,7 @@ socket.onMessage((msg) => {
     // Text fallback when TTS fails
     console.log("[JARVIS]", msg.text);
     showCaption(msg.text);
+    pushChat("jarvis", msg.text as string);
   } else if (type === "task_spawned") {
     console.log("[task]", "spawned:", msg.task_id, msg.prompt);
   } else if (type === "task_complete") {
@@ -368,6 +437,13 @@ const hudTopLeft = document.getElementById("hud-top-left")!;
 const hudWeatherPanel = document.getElementById("hud-weather")!;
 const hudWeatherBody = document.getElementById("hud-weather-body")!;
 const hudActivityList = document.getElementById("hud-activity-list")!;
+const hudMemoryTotalEl = document.getElementById("hud-memory-total")!;
+const hudMemorySyncEl = document.getElementById("hud-memory-sync")!;
+const hudBrainEl = document.getElementById("hud-brain")!;
+// Tracks the last sync timestamp we've already reacted to, so the brief
+// flash fires once per real sync event rather than on every 5s poll that
+// happens to land while that same result is still the latest one.
+let lastFlashedSyncAt: number | null = null;
 
 const HUD_POLL_MS = 5000;
 
@@ -419,6 +495,20 @@ interface HudWeather {
   condition_key: string;
 }
 
+interface HudMemorySync {
+  status: "ok" | "unconfigured" | "never_run";
+  at: number | null; // epoch seconds
+  added: number;
+  updated: number;
+  removed: number;
+}
+
+interface HudMemory {
+  total: number;
+  vault_configured: boolean;
+  last_sync: HudMemorySync;
+}
+
 interface HudStats {
   cpu_percent: number;
   memory_percent: number;
@@ -426,6 +516,7 @@ interface HudStats {
   tokens_target: number;
   tokens_percent: number;
   weather: HudWeather | null;
+  memory: HudMemory;
 }
 
 async function pollHudStats() {
@@ -454,6 +545,26 @@ async function pollHudStats() {
       hudWeatherBody.appendChild(detailEl);
     } else {
       hudWeatherPanel.style.display = "none";
+    }
+
+    const mem = stats.memory;
+    hudMemoryTotalEl.textContent = String(mem.total);
+    const sync = mem.last_sync;
+    if (!mem.vault_configured) {
+      hudMemorySyncEl.textContent = "non configurato";
+    } else if (sync.status === "never_run" || sync.at == null) {
+      hudMemorySyncEl.textContent = "in attesa";
+    } else {
+      const agoSeconds = Math.max(0, Date.now() / 1000 - sync.at);
+      const hasChanges = sync.added > 0 || sync.updated > 0 || sync.removed > 0;
+      const changes = hasChanges ? ` (+${sync.added} ~${sync.updated} -${sync.removed})` : "";
+      hudMemorySyncEl.textContent = `${formatUptime(agoSeconds)} fa${changes}`;
+
+      if (hasChanges && sync.at !== lastFlashedSyncAt) {
+        lastFlashedSyncAt = sync.at;
+        hudBrainEl.classList.add("pulse-sync");
+        setTimeout(() => hudBrainEl.classList.remove("pulse-sync"), 3000);
+      }
     }
   } catch {
     // A missed poll is invisible by design — the gauges just hold their last

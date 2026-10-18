@@ -5,7 +5,8 @@
 export type MessageHandler = (msg: Record<string, unknown>) => void;
 
 export interface JarvisSocket {
-  send(data: Record<string, unknown>): void;
+  /** False when the socket was not open and the message was dropped. */
+  send(data: Record<string, unknown>): boolean;
   onMessage(handler: MessageHandler): void;
   close(): void;
   isConnected(): boolean;
@@ -43,7 +44,12 @@ export function createSocket(url: string): JarvisSocket {
       if (!closed) {
         console.log(`[ws] reconnecting in ${reconnectDelay}ms`);
         setTimeout(connect, reconnectDelay);
-        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+        // Capped at 5s rather than 30s. A background tab has its timers
+        // throttled hard by the browser, so a 30s delay can stretch to
+        // minutes — which is how a page sat disconnected through three server
+        // restarts while still looking alive, because the HUD polls over
+        // plain HTTP and kept updating.
+        reconnectDelay = Math.min(reconnectDelay * 2, 5000);
       }
     };
 
@@ -55,11 +61,26 @@ export function createSocket(url: string): JarvisSocket {
 
   connect();
 
+  // Reconnect the moment the tab comes back to the foreground, without
+  // waiting out whatever delay the throttled timer is sitting on.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && !closed && !connected) {
+      reconnectDelay = 1000;
+      connect();
+    }
+  });
+
   return {
     send(data) {
       if (ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(data));
+        return true;
       }
+      // Dropping this silently is what made a dead socket look like a mute
+      // JARVIS: the speech was recognised, composed, and thrown away with
+      // nothing said about it. The caller decides how to tell the user.
+      console.warn("[ws] not connected — message dropped", data);
+      return false;
     },
     onMessage(handler) {
       handlers.push(handler);
