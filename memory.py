@@ -44,7 +44,8 @@ def init_db():
             importance INTEGER DEFAULT 5, -- 1-10, higher = more important
             created_at REAL NOT NULL,
             last_accessed REAL,
-            access_count INTEGER DEFAULT 0
+            access_count INTEGER DEFAULT 0,
+            vault_synced INTEGER DEFAULT 0  -- confirmed present in a vault file at least once
         );
 
         CREATE TABLE IF NOT EXISTS tasks (
@@ -87,6 +88,13 @@ def init_db():
             content='notes', content_rowid='id'
         );
     """)
+    # A table that existed before vault_synced was added needs it bolted on —
+    # CREATE TABLE IF NOT EXISTS above is a no-op for a table that already
+    # exists, column and all.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)")}
+    if "vault_synced" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN vault_synced INTEGER DEFAULT 0")
+        conn.commit()
     conn.close()
     log.info("Memory database initialized")
 
@@ -101,6 +109,8 @@ def remember(
     source: str = "",
     importance: int = 5,
     supersedes: list[int] | None = None,
+    mirror: bool = True,
+    vault_synced: bool = False,
 ) -> int:
     """Store a memory, optionally retiring the ones it replaces.
 
@@ -108,11 +118,16 @@ def remember(
     over it, and both are then recalled as fact. This database held "the user
     is called Martina Bologna" — invented, never said — next to the correction
     naming him Luca, and went on addressing him by the wrong one.
+
+    `mirror=False` and `vault_synced=True` are for `memory_vault.sync_from_vault()`
+    only: a line typed by hand in Obsidian is already on the page (mirroring it
+    back would duplicate it) and is by definition vault-backed from birth — see
+    `vault_synced` below. Every other caller wants the defaults.
     """
     conn = _get_db()
     cur = conn.execute(
-        "INSERT INTO memories (type, content, source, importance, created_at) VALUES (?, ?, ?, ?, ?)",
-        (mem_type, content, source, importance, time.time())
+        "INSERT INTO memories (type, content, source, importance, created_at, vault_synced) VALUES (?, ?, ?, ?, ?, ?)",
+        (mem_type, content, source, importance, time.time(), 1 if vault_synced else 0)
     )
     mem_id = cur.lastrowid
     # Update FTS
@@ -142,14 +157,72 @@ def remember(
     # Vault mirror is best-effort and off SQLite's transaction — a write here
     # failing (or being skipped, unconfigured) must never affect the memory
     # that already committed above.
-    try:
-        for old_id in superseded_ids:
-            memory_vault.mirror_forget(old_id)
-        memory_vault.mirror_remember(mem_id, mem_type, content)
-    except Exception as e:
-        log.warning(f"Vault mirror failed for memory #{mem_id}: {e}")
+    if mirror:
+        try:
+            for old_id in superseded_ids:
+                memory_vault.mirror_forget(old_id)
+            memory_vault.mirror_remember(mem_id, mem_type, content)
+            # Reached only if the write above didn't raise — the id is now
+            # provably on a page in the vault, which is the one condition
+            # that makes it safe for sync_from_vault() to ever delete it for
+            # not being there.
+            mark_vault_synced(mem_id)
+        except Exception as e:
+            log.warning(f"Vault mirror failed for memory #{mem_id}: {e}")
 
     return mem_id
+
+
+def mark_vault_synced(mem_id: int) -> None:
+    """Record that `mem_id` has been confirmed present in a vault file.
+
+    This flag is the only thing that makes a memory eligible for
+    `memory_vault.sync_from_vault()` to delete on the grounds that a vault
+    file no longer lists it. Everything created before vault mirroring
+    existed — or any memory whose mirror write silently failed — has never
+    earned this flag and stays permanently exempt from that deletion path,
+    which is exactly the protection that was missing when sync_from_vault()
+    first shipped: it read a file's absence of a line as "the user deleted
+    this" for memories the vault had simply never heard of, and erased nine
+    of them, among them the user's own name and city.
+    """
+    conn = _get_db()
+    conn.execute("UPDATE memories SET vault_synced = 1 WHERE id = ?", (mem_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_memory_content(mem_id: int, content: str) -> bool:
+    """Overwrite a memory's text in place, keeping its id and FTS row live.
+
+    For `memory_vault.sync_from_vault()`: the vault is authoritative once
+    that runs, so when a hand-edited line's text no longer matches what's on
+    file here, the file wins.
+    """
+    conn = _get_db()
+    row = conn.execute("SELECT id FROM memories WHERE id = ?", (mem_id,)).fetchone()
+    if not row:
+        conn.close()
+        return False
+    conn.execute("UPDATE memories SET content = ? WHERE id = ?", (content, mem_id))
+    conn.execute("UPDATE memory_fts SET content = ? WHERE rowid = ?", (content, mem_id))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_all_memories(mem_type: str | None = None) -> list[dict]:
+    """All memories, optionally filtered to one type. No limit — callers that
+    reconcile against the vault need the complete set, not a sample."""
+    conn = _get_db()
+    if mem_type:
+        results = conn.execute(
+            "SELECT * FROM memories WHERE type = ? ORDER BY id", (mem_type,)
+        ).fetchall()
+    else:
+        results = conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in results]
 
 
 def forget(mem_id: int) -> bool:
@@ -248,6 +321,14 @@ def get_important_memories(limit: int = 10) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in results]
+
+
+def count_memories() -> int:
+    """Total memory count, for the HUD tile — a size, not a sample."""
+    conn = _get_db()
+    n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    conn.close()
+    return n
 
 
 # ---------------------------------------------------------------------------
