@@ -1,6 +1,7 @@
 # Environment
 .env
 .env.local
+.env.bak*
 
 # Dependencies
 node_modules/
