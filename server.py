@@ -50,13 +50,19 @@ from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
     format_tasks_for_voice, extract_memories, get_important_memories,
-    forget, delete_task, delete_note,
+    count_memories, forget, delete_task, delete_note,
 )
+import memory_vault
 import undo
 import confirm
 from notes_access import get_recent_notes, get_note_folders, read_note, search_notes_apple, create_apple_note
 from obsidian_access import search_vault, read_vault_note, vault_stats, format_search_for_voice
 from phrases import phrase, ensure_language
+import llm
+from llm import LLMClient
+from plugin_loader import discover_plugins, set_enabled as set_plugin_enabled
+from proactive import ProactiveService
+import vault_index
 from proc import run_capture, run_detached, env_without
 from tts import list_voices, resolve_voice, speak as macos_speak
 from dispatch_registry import DispatchRegistry
@@ -201,54 +207,38 @@ CONVERSATION STYLE:
 SELF-AWARENESS:
 You ARE the JARVIS project at {project_dir} on {user_name}'s computer. Your code is Python (FastAPI server, WebSocket voice, Fish Audio TTS, Anthropic API). You were built by {user_name}. If asked about yourself, your code, how you work, or your line count — use [ACTION:PROMPT_PROJECT] to check the jarvis project. You have full access to your own source code.
 
-YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT NOW):
-- You CAN open Terminal.app via AppleScript
-- You CAN open Google Chrome and browse any URL or search query
-- You CAN spawn Claude Code in a Terminal window for coding tasks
-- You CAN create project folders on the Desktop
-- You CAN check Desktop projects and their git status
-- You CAN plan complex tasks by asking smart questions before executing
-- You CAN see what's on {user_name}'s screen — open windows, active apps, and screenshot vision
-- You CAN read {user_name}'s calendar — today's events, upcoming meetings, schedule overview
-- You CAN read {user_name}'s email (READ-ONLY) — unread count, recent messages, search by sender/subject. You CANNOT send, delete, or modify emails.
-- You CAN read Apple Notes and create NEW notes — but you CANNOT edit or delete existing notes
-- You CAN manage tasks — create, complete, and list to-do items with priorities and due dates
-- You CAN help plan {user_name}'s day — combine calendar events, tasks, and priorities into an organized plan
-- You CAN remember facts about {user_name} — preferences, decisions, goals. Use [ACTION:REMEMBER] to store important info.
+YOUR CAPABILITIES — all REAL and ACTIVE right now. Your tools describe
+themselves; beyond those you can also: read {user_name}'s email (READ-ONLY —
+never send, delete or modify), read Apple Notes and create new ones (never edit
+or delete existing), manage to-do tasks, spawn Claude Code in a Terminal to
+build or research, create project folders on the Desktop and check their git
+status, and remember facts about {user_name} with [ACTION:REMEMBER].
 
 DAY PLANNING:
-When {user_name} asks to plan his day or schedule, DO NOT dispatch to a project. Instead:
-1. Look at the calendar context and tasks already in your system prompt
-2. Ask what his priorities are
-3. Help organize by suggesting time blocks and task order
-4. Use [ACTION:ADD_TASK] to create tasks he agrees to
-5. Use [ACTION:ADD_NOTE] to save the plan as a note
-Keep the planning conversational — don't try to do everything in one response.
+Asked to plan his day, do NOT dispatch to a project. Use the calendar and tasks
+already in this prompt, ask what his priorities are, suggest time blocks, then
+[ACTION:ADD_TASK] for what he agrees to and [ACTION:ADD_NOTE] to save the plan.
+Keep it conversational — not everything in one response.
 
 BUILD PLANNING:
-When {user_name} wants to BUILD something new:
-- Do NOT immediately dispatch [ACTION:BUILD]. Ask 1-2 quick questions FIRST to nail down specifics.
-- Good questions: "What should this look like?" / "Any specific features?" / "Which framework?"
-- If he says "just build it" or "figure it out" — skip questions, use React + Tailwind as defaults.
-- Once you have enough info, confirm the plan in ONE sentence and THEN dispatch [ACTION:BUILD] with a detailed description.
-- The DISPATCHES section shows what you're currently building and what finished recently.
-- When asked "where are we at" or "status" — check DISPATCHES, don't re-dispatch.
-- NEVER hallucinate progress. If the build is still running, say "Still working on it, sir" — don't make up details about what's happening.
-- NEVER guess localhost ports. Check the DISPATCHES section for the actual URL. If a dispatch says "Running at http://localhost:5174" — use THAT URL, not a guess.
-- When asked to "pull it up" or "show me" — use [ACTION:BROWSE] with the URL from DISPATCHES. Do NOT dispatch to the project again just to find the URL.
-IMPORTANT: Actions like opening Terminal, Chrome, or building projects are handled AUTOMATICALLY by your system — you do NOT need to describe doing them. If the user asks you to build something or search something, your system will handle the execution separately. In your response, just TALK — have a conversation. Don't say "I'll build that now" or "Claude Code is working on..." unless your system has actually triggered the action.
-If the user asks you to do something you genuinely can't do, say "I'm afraid that's beyond my current reach, sir." Don't fake executing actions.
+Before [ACTION:BUILD], ask 1-2 questions to pin down specifics ("What should
+this look like?" / "Which framework?"). If he says "just build it", skip them
+and default to React + Tailwind. Then confirm the plan in ONE sentence and
+dispatch with a detailed description.
+- DISPATCHES below shows what is building and what just finished. Asked "where
+  are we at", read it — do not re-dispatch.
+- NEVER invent progress. Still running means "Still working on it, sir."
+- NEVER guess a localhost port; take the URL from DISPATCHES.
+Execution is automatic — your system runs the action separately. Just talk;
+don't narrate doing it, and never fake having done it.
 
 YOUR INTERFACE:
-The user interacts with you through a web browser showing a particle orb visualization that reacts to your voice. The interface has these controls:
-- **Three-dot menu** (top right): contains Settings, Restart Server, and Fix Yourself options
-- **Settings panel**: Opens from the menu. Users can enter API keys (Anthropic, Fish Audio), test connections, set their name and preferences, and see system status (calendar, mail, notes connectivity). Keys are saved to the .env file.
-- **Mute button**: Toggles your listening on/off. When muted, you can't hear the user. They click it again to unmute.
-- **Restart Server**: Restarts your backend process. Useful if something seems stuck.
-- **Fix Yourself**: Opens Claude Code in your own project directory so you can debug and fix issues in your own code.
-- **The orb**: The glowing particle visualization in the center. It reacts to your voice when speaking, pulses when listening, and swirls when thinking.
-
-If asked about any of these, explain them briefly and naturally. If the user is having trouble, suggest the relevant control: "Try the settings panel — the gear icon in the top right." or "The mute button may be active, sir."
+A browser page with a particle orb that reacts to your voice, a mute button,
+and a three-dot menu (top right) holding Settings — API keys, name, preferences,
+integration status — plus Restart Server and Fix Yourself, which opens Claude
+Code on your own source. If he is stuck, point at the relevant control: "Try the
+settings panel — the gear icon in the top right." or "The mute button may be
+active, sir."
 
 SPEECH-TO-TEXT CORRECTIONS (the user speaks, speech recognition may mishear):
 - "Cloud code" or "cloud" = "Claude Code" or "Claude"
@@ -260,41 +250,27 @@ ONE sentence is ideal. TWO is the maximum for the spoken part. Never three.
 No markdown, no bullet points, no code blocks in voice responses.
 Action tags at the end do NOT count toward your sentence limit.
 
-BANNED PHRASES — NEVER USE THESE:
-- "Absolutely" / "Absolutely right"
-- "Great question"
-- "I'd be happy to"
-- "Of course"
-- "How can I help"
-- "Is there anything else"
-- "I apologize"
-- "I should clarify"
-- "I cannot" (for things listed in YOUR CAPABILITIES)
-- "I don't have access to" (instead: "I'm afraid that's beyond my current reach, sir")
-- "As an AI" (never break character)
-- "Let me know if" / "Feel free to"
-- Any sentence starting with "I"
+NEVER SAY: "Absolutely", "Great question", "I'd be happy to", "Of course",
+"How can I help", "Is there anything else", "I apologize", "I should clarify",
+"As an AI", "Let me know if", "Feel free to", "I cannot" or "I don't have
+access to" for anything you can actually do — and never open a sentence with
+"I". For something genuinely out of reach: "I'm afraid that's beyond my current
+reach, sir."
 
-INSTEAD SAY:
-- "Will do, sir."
-- "Right away, sir."
-- "Understood."
-- "Consider it done."
-- "Done, sir."
-- "Terminal is open."
-- "Pulled that up in Chrome."
+SAY INSTEAD: "Will do, sir." / "Right away, sir." / "Understood." / "Consider
+it done." / "Done, sir." / "Terminal is open." / "Pulled that up in Chrome."
 
 ACTION SYSTEM:
 When you decide the user needs something DONE (not just discussed), include an action tag in your response:
-- [ACTION:SCREEN] — capture and describe the user's display. ONLY for questions about the screen itself: what is visible, what is open, what app is running. It photographs the monitor, so it can tell you nothing about a calendar, an inbox, or anything else you cannot see on screen. Do NOT use PROMPT_PROJECT for screen requests.
-- [ACTION:CALENDAR] — re-read Apple Calendar. Use whenever the user asks about their schedule, meetings, appointments, or what the day holds, and the SCHEDULE section below is empty, stale, or does not answer them.
 - [ACTION:MAIL] — re-read Apple Mail. Use whenever the user asks about email, unread messages, or their inbox, and the EMAIL section below does not answer them.
 - [ACTION:VAULT] search terms — search the user's Obsidian vault, their written notes and research. Use when they ask what they wrote, noted, or saved about a topic, or to look something up in their notes or their vault. Pass the topic to search for, not a whole sentence. READ-ONLY: you can find and quote notes, never change them.
 - [ACTION:BUILD] description — when user wants a project built. Claude Code does the work.
-- [ACTION:BROWSE] url or search query — when user wants to see a webpage or search result in Chrome
 - [ACTION:RESEARCH] detailed research brief — when user wants real research with real data. Claude Code will browse the web, find real listings/data, and create a report document. Give it a detailed brief of what to find.
 - [ACTION:OPEN_TERMINAL] — when user just wants a fresh Claude Code terminal with no specific project
-CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're LOOKING AT — ALWAYS use [ACTION:SCREEN] or let the fast action system handle it. NEVER use [ACTION:PROMPT_PROJECT] for screen requests. PROMPT_PROJECT is ONLY for working on code projects. Equally, never reach for SCREEN to answer a question about the calendar or the inbox — CALENDAR and MAIL are the actions that read those.
+
+The screen, the calendar and the browser are NOT action tags — they are tools
+(`screen`, `calendar`, `browse`) and you call them directly. Never use
+PROMPT_PROJECT for a screen request: that is only for working on code projects.
 
 - [ACTION:PROMPT_PROJECT] project_name ||| prompt — THIS IS YOUR MOST POWERFUL ACTION. Use it whenever the user wants to work on, jump into, resume, check on, or interact with ANY existing project. You connect directly to Claude Code in that project and can read its response. Craft a clear prompt based on what the user wants. Examples:
   "jump into client engine" → [ACTION:PROMPT_PROJECT] The Client Engine ||| What is the current state of this project? Summarize what was being worked on most recently.
@@ -332,9 +308,23 @@ Place the tag at the END of your spoken response. Example:
 IMPORTANT:
 - Do NOT use action tags for casual conversation
 - Do NOT use action tags if the user is still explaining (ask questions first)
-- Do NOT use [ACTION:BROWSE] just because someone mentions a URL in conversation
+- Do NOT call `browse` just because someone mentions a URL in conversation
 - When in doubt, just TALK — you can always act later
 """
+
+
+# Derived from the prompt itself rather than hand-listed, so it cannot drift
+# out of sync when a tag is added or renamed above. A plugin may not take one
+# of these names: two routes to the same capability, one a tool call and one a
+# text tag, is a coin toss the model would have to keep winning.
+_RESERVED_TOOL_NAMES = {
+    tag.lower() for tag in re.findall(r"\[ACTION:([A-Z_]+)\]", JARVIS_SYSTEM_STATIC)
+}
+
+# How many times a single voice turn may go back to the model to run plugins.
+# Two is enough for "check the calendar, then open the app": a third round has
+# never been a plan in practice, only a loop.
+_MAX_TOOL_ROUNDS = 2
 
 
 # Everything that changes turn to turn. Rendered as a separate, uncached
@@ -1007,6 +997,19 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     return response, None
 
 
+# Some fallback models narrate their own tag decision instead of silently
+# skipping it — e.g. "[No action tags included since this is a test]". By the
+# time this runs, extract_action() has already consumed any real [ACTION:X]
+# tag through to the end of the string, so a bracket group still present here
+# cannot be one; it is leaked meta-commentary and never meant for the user.
+_STRAY_BRACKET_RE = re.compile(r"\[(?!ACTION:)[^\[\]]{0,300}\]")
+
+
+def strip_stray_brackets(text: str) -> str:
+    cleaned = _STRAY_BRACKET_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 async def _execute_build(target: str):
     """Execute a build action from an LLM-embedded [ACTION:BUILD] tag."""
     try:
@@ -1488,8 +1491,14 @@ async def generate_response(
     conversation_history: list[dict],
     last_response: str = "",
     session_summary: str = "",
+    ws=None,
 ) -> str:
-    """Generate a JARVIS response using Anthropic API."""
+    """Generate a JARVIS response using Anthropic API.
+
+    `ws` is handed to any plugin whose run() asks for it, so a plugin can push
+    to the frontend directly. Optional — plugins that do not declare it never
+    see it, and callers that do not pass it still work.
+    """
     now = datetime.now()
     current_time = now.strftime("%A, %B %d, %Y at %I:%M %p")
 
@@ -1573,6 +1582,16 @@ async def generate_response(
     if memory_ctx:
         system.append({"type": "text", "text": f"\n\nJARVIS MEMORY:\n{memory_ctx}"})
 
+    # And anything the user themselves wrote about this, from their vault.
+    # Different question from the one above: JARVIS MEMORY is what JARVIS chose
+    # to remember, this is what the user wrote and forgot they wrote. Embedded
+    # locally by Ollama, so it costs no tokens and no API call — and fails to
+    # an empty string when Ollama is not running, which is why it is not
+    # guarded here.
+    vault_ctx = await asyncio.to_thread(_vault_recall, text)
+    if vault_ctx:
+        system.append({"type": "text", "text": f"\n\n{vault_ctx}"})
+
     # Three-tier memory — inject rolling summary of earlier conversation
     if session_summary:
         system.append({"type": "text", "text":
@@ -1592,18 +1611,60 @@ async def generate_response(
     if not messages or messages[-1].get("content") != text:
         messages = messages + [{"role": "user", "content": text}]
 
+    # Plugins arrive as real tool declarations. Tools are serialised ahead of
+    # the system blocks in the cache key, so this list has to be byte-stable
+    # across turns or it invalidates the static block below it — it is, because
+    # discovery order is sorted and the enabled set only changes when someone
+    # toggles a plugin.
+    tools = plugin_registry.tool_declarations() if plugin_registry else []
+
     try:
-        response = await client.messages.create(
-            # Sonnet 5's cache minimum is 1024 tokens; Haiku 4.5's is 4096,
-            # which the static block (~3600 tokens) falls short of — caching
-            # would write every turn and never once read. Sonnet is the
-            # cheapest current model where the cache actually activates.
-            model="claude-sonnet-5",
-            max_tokens=250,  # Extra room for [ACTION:X] tags
-            system=system,
-            messages=messages,
-        )
-        track_usage(response)
+        for round_num in range(_MAX_TOOL_ROUNDS + 1):
+            response = await client.messages.create(
+                # Sonnet 5's cache minimum is 1024 tokens; Haiku 4.5's is 4096,
+                # which the static block (~3600 tokens) falls short of — caching
+                # would write every turn and never once read. Sonnet is the
+                # cheapest current model where the cache actually activates.
+                model="claude-sonnet-5",
+                max_tokens=250,  # Extra room for [ACTION:X] tags
+                system=system,
+                messages=messages,
+                **({"tools": tools} if tools else {}),
+            )
+            track_usage(response)
+
+            if response.stop_reason != "tool_use":
+                break
+
+            # Claude asked for one or more plugins. Run them, feed the results
+            # back, and let it turn them into something worth saying — the
+            # spoken reply comes from the round after the last tool call.
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                log.info(f"Plugin call: {block.name}({block.input})")
+                output = await plugin_registry.run(
+                    block.name, block.input or {}, ws=ws, client=client
+                )
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": output,
+                })
+
+            messages = messages + [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": results},
+            ]
+        else:
+            # Ran out of rounds with a tool call still pending. Rare enough to
+            # be a bug when it happens, and cheap to bound: without a ceiling a
+            # confused model can bounce between two plugins indefinitely, on
+            # the user's money.
+            log.warning(f"Tool loop exceeded {_MAX_TOOL_ROUNDS} rounds — giving up")
+            return "I got stuck working that out, sir. Try asking me again."
+
         # Sonnet 5 has adaptive thinking on by default (this call never sets
         # `thinking`, which means "adaptive", not "off" — that changed moving
         # off Haiku). When it thinks, content[0] is a ThinkingBlock with no
@@ -1627,6 +1688,7 @@ async def generate_response(
 # Shared state
 task_manager = ClaudeTaskManager(max_concurrent=3)
 anthropic_client: Optional[anthropic.AsyncAnthropic] = None
+plugin_registry = None  # set in lifespan by discover_plugins()
 cached_projects: list[dict] = []
 recently_built: list[dict] = []  # [{"name": str, "path": str, "time": float}]
 dispatch_registry = DispatchRegistry()
@@ -1891,6 +1953,54 @@ async def _notify_activity(text: str):
 # whoever happens to be listening.
 
 
+async def _index_vault():
+    """Keep the vault index current: once at startup, then hourly.
+
+    Hourly rather than on a file watcher: notes edited in Obsidian are worth
+    picking up, but not within the second, and a watcher on a vault that syncs
+    across devices fires far more often than anything changed.
+    """
+    while True:
+        try:
+            result = await asyncio.to_thread(vault_index.reindex)
+            if result.get("status") == "ok" and result.get("indexed"):
+                log.info(f"Vault indexed: {result['indexed']} notes, "
+                         f"{result['chunks']} chunks in {result['seconds']:.0f}s")
+            elif result.get("status") == "embeddings_unavailable":
+                log.warning("Vault index incomplete — is Ollama running?")
+        except Exception as e:
+            log.warning(f"Vault indexing failed: {e}")
+
+        # Same cadence, same reasoning — the vault's memory notes are now the
+        # source of truth for what JARVIS remembers, not just a readable copy
+        # of it. A failure here is independent of the reindex above: one
+        # falling behind must not stall the other.
+        try:
+            await asyncio.to_thread(memory_vault.sync_from_vault)
+        except Exception as e:
+            log.warning(f"Vault memory sync failed: {e}")
+
+        await asyncio.sleep(3600)
+
+
+def _vault_recall(text: str) -> str:
+    """Semantic recall over the user's notes, as a prompt block or ''.
+
+    Blocking (one local embedding plus a cosine sweep, ~150ms on this vault),
+    so callers run it in a thread. Never raises: a vault lookup failing must
+    cost the turn nothing but the context it would have added.
+    """
+    # Very short turns — "sì", "grazie", "aspetta" — carry no topic to search
+    # on, and embedding them returns whatever the vault's centre of mass is.
+    if len(text.strip()) < 12:
+        return ""
+    try:
+        return vault_index.format_for_prompt(vault_index.search(text))
+    except Exception as e:
+        log.debug(f"Vault recall failed: {e}")
+        return ""
+
+
 async def _announce(text: str):
     """Speak `text` to every connected client, unprompted.
 
@@ -1948,14 +2058,34 @@ battery_monitor = battery.BatteryMonitor(
     has_listener=lambda: bool(task_manager._websockets),
 )
 
+# Zero means "silent since forever", which is the right starting point: a
+# freshly started server has no idea whether anyone is sitting there.
+_activity = {"last_user": 0.0}
+
+# Built in lifespan, once the plugin registry it polls exists.
+proactive_service: Optional[ProactiveService] = None
+
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global anthropic_client, cached_projects
+    global anthropic_client, cached_projects, plugin_registry, proactive_service
     if ANTHROPIC_API_KEY:
-        anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        # Wrapped, not replaced: LLMClient presents the same messages.create /
+        # messages.stream surface, and only routes elsewhere when Anthropic
+        # says the balance is gone. With no OPENROUTER_API_KEY set it is a
+        # pass-through and behaves exactly as before.
+        anthropic_client = LLMClient(
+            anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY),
+            openrouter_key=os.getenv("OPENROUTER_API_KEY", ""),
+        )
+        if anthropic_client.can_fallback:
+            log.info(f"LLM fallback armed: {llm.OPENROUTER_MODEL}")
     else:
         log.warning("ANTHROPIC_API_KEY not set — LLM features disabled")
+
+    # Discovered once per process. A plugin that fails to import is rejected
+    # and logged; it cannot stop the server from coming up.
+    plugin_registry = discover_plugins(reserved=_RESERVED_TOOL_NAMES)
 
     # Warm the fixed phrases for the configured language. Backgrounded: a
     # translation costs one Haiku call on a cold cache, and JARVIS should not
@@ -1979,12 +2109,29 @@ async def lifespan(application: FastAPI):
     timer_service.start()
     battery_monitor.start()
 
+    proactive_service = ProactiveService(
+        plugin_registry,
+        _announce,
+        has_listener=lambda: bool(task_manager._websockets),
+        last_activity=lambda: _activity["last_user"],
+        client_provider=lambda: anthropic_client,
+    )
+    proactive_service.start()
+
+    # Index the vault in the background. First run on a cold index takes ~40s
+    # for 100-odd notes; every run after that only touches what changed, and
+    # the whole thing is skipped in seconds when nothing has. Backgrounded
+    # because none of it should stand between the server and its first reply.
+    asyncio.create_task(_index_vault())
+
     log.info("JARVIS server starting")
 
     yield
 
     timer_service.stop()
     battery_monitor.stop()
+    if proactive_service:
+        proactive_service.stop()
 
 
 app = FastAPI(title="JARVIS Server", version="0.1.0", lifespan=lifespan)
@@ -2036,6 +2183,11 @@ async def hud_stats():
         "tokens_target": _DAILY_TOKEN_TARGET,
         "tokens_percent": min(100, round(100 * tokens_today / _DAILY_TOKEN_TARGET)),
         "weather": weather,
+        "memory": {
+            "total": count_memories(),
+            "vault_configured": bool(os.getenv("OBSIDIAN_VAULT", "").strip()),
+            "last_sync": memory_vault.get_last_sync(),
+        },
     }
 
 
@@ -2740,6 +2892,10 @@ async def voice_handler(ws: WebSocket):
             _cancel_response = False
 
             voice_state["last_user_time"] = time.time()
+            # Same stamp, but reachable from outside this handler: the
+            # proactive service has to know how long the user has been quiet,
+            # and voice_state is per-connection.
+            _activity["last_user"] = time.time()
             log.info(f"User: {user_text}")
             await ws.send_json({"type": "status", "state": "thinking"})
 
@@ -2821,6 +2977,7 @@ async def voice_handler(ws: WebSocket):
                             cached_projects, history,
                             last_response=last_jarvis_response,
                             session_summary=session_summary,
+                            ws=ws,
                         )
                     else:
                         # Send to claude -p (full power)
@@ -2926,13 +3083,14 @@ async def voice_handler(ws: WebSocket):
                                 cached_projects, history,
                                 last_response=last_jarvis_response,
                                 session_summary=session_summary,
+                                ws=ws,
                             )
 
                             # Check for action tags embedded in LLM response
                             clean_response, embedded_action = extract_action(response_text)
+                            response_text = strip_stray_brackets(clean_response)
                             if embedded_action:
                                 log.info(f"LLM embedded action: {embedded_action}")
-                                response_text = clean_response
                                 # Ensure there's always something to speak
                                 if not response_text.strip():
                                     action_type = embedded_action["action"]
@@ -3397,6 +3555,42 @@ async def api_save_preferences(body: PreferencesUpdate):
     # A new language needs its own set of fixed phrases.
     asyncio.create_task(_refresh_phrases())
     return {"success": True}
+
+# ---------------------------------------------------------------------------
+# Plugins
+# ---------------------------------------------------------------------------
+
+class PluginToggle(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/llm")
+async def api_llm_status():
+    """Which provider is answering right now, and why."""
+    if anthropic_client is None:
+        return {"provider": None, "fallback_available": False}
+    return anthropic_client.status()
+
+
+@app.get("/api/plugins")
+async def api_list_plugins():
+    """Every discovered plugin, including the rejected ones and why — a plugin
+    that failed to load has to be visible somewhere, or it just seems ignored."""
+    if plugin_registry is None:
+        return {"plugins": []}
+    return {"plugins": plugin_registry.list_for_ui()}
+
+
+@app.post("/api/plugins/{name}")
+async def api_toggle_plugin(name: str, body: PluginToggle):
+    """Enable or disable a plugin. Takes effect on the next voice turn — no
+    restart, because the enabled set is re-read on every request."""
+    if plugin_registry is None or not plugin_registry.has(name):
+        return JSONResponse({"error": f"No plugin named '{name}'"}, status_code=404)
+    set_plugin_enabled(name, body.enabled)
+    log.info(f"Plugin '{name}' {'enabled' if body.enabled else 'disabled'}")
+    return {"success": True, "name": name, "enabled": body.enabled}
+
 
 # ---------------------------------------------------------------------------
 # Control endpoints (restart, fix-self)
